@@ -1,6 +1,6 @@
 # Hyperbolic Latent Flow Matching
 
-![Model architecture](figures/HFM.drawio.pdf)
+![Model architecture](HFM.drawio.pdf)
 
 This repository combines:
 - HAE (Hyperbolic Attribute Editing) for training and inference/embedding extraction.
