@@ -2,10 +2,7 @@
 
 ![Model architecture](HFM.drawio.png)
 
-This repository combines:
-- HAE (Hyperbolic Attribute Editing) for training and inference/embedding extraction.
-- Riemannian Flow Matching (RFM) for learning a flow on those embeddings.
-
+Learning image representations that respect the intrinsic geometry of data is crucial for capturing hierarchical semantic structure, yet generative transport is typically performed in Euclidean spaces where this structure is not preserved. In this work, we propose a geometry-aware generative framework that combines hyperbolic representation learning with Riemannian Flow Matching to perform generative transport directly in hyperbolic latent space. Instead of learning generative dynamics in pixel space or Euclidean latents, we transport samples directly on the manifold produced by a pretrained hyperbolic autoencoder, preserving geometric organization and yielding more stable samples than Euclidean latent transport. We further investigate curvature as a controllable geometric inductive bias and observe a trade-off between generation realism and diversity, where moderate curvature yields more coherent samples, and larger curvature allows visual variation at the cost of stability, highlighting how latent geometry shapes generative transport. 
 
 
 ## 1) Environments
@@ -25,6 +22,8 @@ Create the conda environment for RFM:
 conda env create -f riemannian-fm/environment.yml
 conda activate manifm
 ```
+
+This repository is compatible with NVIDIA GPUs up to A100/H100 architectures.
 
 ## 2) Dataset
 
@@ -214,11 +213,11 @@ python train.py experiment=euclidean seed=0
 
 ## Citations
 
-This code was adapted from the following repositories
+This codebase builds upon the following repositories:
 
 ``` 
 https://github.com/lingxiao-li/HAE.git
 https://github.com/facebookresearch/riemannian-fm
 ```
-
+The original HE environment is not compatible with the current framework nor with newer NVIDIA GPU architectures (A100/H100).
 
