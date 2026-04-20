@@ -1,7 +1,6 @@
 """
 This file defines the core research contribution
 """
-from audioop import bias
 import matplotlib
 matplotlib.use('Agg')
 import math
@@ -13,7 +12,6 @@ import torch.nn.functional as F
 from models.encoders import psp_encoders
 from models.stylegan2.model import Generator
 from models.hyper_nets import MobiusLinear, HyperbolicMLR
-from configs.paths_config import model_paths
 
 
 def get_keys(d, name):
