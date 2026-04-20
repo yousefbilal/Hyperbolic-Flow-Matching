@@ -2,17 +2,15 @@
 Network definitions from https://github.com/ferrine/hyrnn
 """
 
-from audioop import bias
 import geoopt
 import geoopt.manifolds.stereographic.math as gmath
 import math
 
 import torch
 import torch.nn.init as init
-import numpy as np
 import torch.nn
 import torch.nn.functional
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 
 def _tensor_dot(x, y):
     res = torch.einsum("ij,kj->ik", (x, y))
@@ -138,14 +136,14 @@ class MobiusLinear(torch.nn.Linear):
             fp64_hyper=False,
             **kwargs
     ):
-        k = torch.tensor(k)
+        k_t = torch.tensor(k)
         super().__init__(*args, **kwargs)
         if self.bias is not None:
             if hyperbolic_bias:
-                self.ball = manifold = geoopt.PoincareBall(c=k.abs())
+                self.ball = manifold = geoopt.PoincareBall(c=k_t.abs())
                 self.bias = geoopt.ManifoldParameter(self.bias, manifold=manifold)
                 with torch.no_grad():
-                    self.bias.set_(gmath.expmap0(self.bias.normal_() / 4, k=k))
+                    self.bias.set_(gmath.expmap0(self.bias.normal_() / 4, k=k_t))
                     #self.bias.set_(gmath.expmap0(self.bias.normal_() / 400, k=k))
         with torch.no_grad():
             # 1e-2 was the original value in the code. The updated one is from HNN++
@@ -165,7 +163,7 @@ class MobiusLinear(torch.nn.Linear):
             input = input.double()
         else:
             input = input.float()
-        with autocast(enabled=False):  # Do not use fp16
+        with autocast("cuda", enabled=False):  # Do not use fp16
             return mobius_linear(
                 input,
                 weight=self.weight,
