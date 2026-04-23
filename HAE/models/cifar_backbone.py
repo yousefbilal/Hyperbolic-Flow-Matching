@@ -74,6 +74,58 @@ class UpBlock(nn.Module):
         x = self.res2(x)
         return x
 
+# class UpBlock(nn.Module):
+#     """Upsample via pixel shuffle (learned) → 2 × ResBlock."""
+
+#     def __init__(self, in_ch: int, out_ch: int, num_groups: int = 8):
+#         super().__init__()
+#         # Conv expands to out_ch*4 channels, PixelShuffle folds 4 into 2×2 spatial
+#         self.up = nn.Sequential(
+#             nn.Conv2d(in_ch, out_ch * 4, kernel_size=3, padding=1, bias=False),
+#             nn.PixelShuffle(upscale_factor=2),   # (B, out_ch*4, H, W) → (B, out_ch, 2H, 2W)
+#             nn.GroupNorm(min(num_groups, out_ch), out_ch),
+#             nn.LeakyReLU(0.2, inplace=True),
+#         )
+#         self.res1 = ResBlock(out_ch, num_groups)
+#         self.res2 = ResBlock(out_ch, num_groups)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         return self.res2(self.res1(self.up(x)))
+
+# class UpBlock(nn.Module):
+#     """Upsample via pixel shuffle (learned) → 2 × ResBlock."""
+
+#     def __init__(self, in_ch: int, out_ch: int, num_groups: int = 8):
+#         super().__init__()
+#         self.up = nn.Sequential(
+#             nn.Conv2d(in_ch, out_ch * 4, kernel_size=3, padding=1, bias=False),
+#             nn.PixelShuffle(upscale_factor=2),
+#             # GroupNorm removed — it amplifies checkerboard after shuffle
+#             nn.LeakyReLU(0.2, inplace=True),
+#         )
+#         # ICNR init: makes pixel shuffle start as nearest-neighbor upsampling
+#         # prevents checkerboard artifacts from uneven sub-pixel group weights
+#         self._icnr_init(self.up[0], upscale=2)
+
+#         self.res1 = ResBlock(out_ch, num_groups)
+#         self.res2 = ResBlock(out_ch, num_groups)
+
+#     @staticmethod
+#     def _icnr_init(conv: nn.Conv2d, upscale: int = 2):
+#         """Fill conv weight so every upscale²-group starts identical.
+#         Each spatial filter is copied across all sub-pixel positions,
+#         which is equivalent to starting from nearest-neighbor upsampling."""
+#         with torch.no_grad():
+#             new_weight = conv.weight.clone()
+#             # out_ch*4 filters, grouped in blocks of upscale²=4
+#             # copy the first filter in each block to the rest
+#             for i in range(0, conv.out_channels, upscale ** 2):
+#                 new_weight[i: i + upscale ** 2] = new_weight[i].unsqueeze(0)
+#             conv.weight.copy_(new_weight)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         return self.res2(self.res1(self.up(x)))
+
 
 # ---------------------------------------------------------------------------
 # Encoder
