@@ -27,7 +27,7 @@ from torchvision.utils import save_image
 
 # -- project imports (HAE is the working dir) --------------------------------
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from models.hae_cifar import HAECifar
+from models.hae_cifar import HAECifar, AECifar
 
 # datasets live one level above HAE/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -49,10 +49,13 @@ def parse_args():
     p.add_argument("--data_root", type=str, default="./data")
 
     # model
+    p.add_argument("--model", type=str, default="hae",
+                   choices=["hae", "ae"],
+                   help="Model type: 'hae' (hyperbolic) or 'ae' (plain autoencoder)")
     p.add_argument("--latent_dim", type=int, default=512)
     p.add_argument("--feature_size", type=int, default=512)
     p.add_argument("--curvature", type=float, default=-1.0,
-                   help="Negative curvature k for the Poincaré ball")
+                   help="Negative curvature k for the Poincaré ball (only for HAE)")
 
     # training
     p.add_argument("--num_epochs", type=int, default=200)
@@ -141,13 +144,23 @@ def main():
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=args.workers, drop_last=False, pin_memory=True)
 
+
     # ---- Model ------------------------------------------------------------
-    model = HAECifar(
-        num_classes=num_classes,
-        latent_dim=args.latent_dim,
-        feature_size=args.feature_size,
-        curvature=args.curvature,
-    ).to(device)
+    if args.model == "hae":
+        model = HAECifar(
+            num_classes=num_classes,
+            latent_dim=args.latent_dim,
+            feature_size=args.feature_size,
+            curvature=args.curvature,
+        ).to(device)
+        print("Using HAECifar (hyperbolic autoencoder)")
+    else:
+        model = AECifar(
+            num_classes=num_classes,
+            latent_dim=args.latent_dim,
+            feature_size=args.feature_size,
+        ).to(device)
+        print("Using AECifar (plain autoencoder)")
     print(model)
 
     # ---- Optimiser --------------------------------------------------------
@@ -159,7 +172,7 @@ def main():
     )
 
     # ---- Losses -----------------------------------------------------------
-    l1_loss_fn = nn.L1Loss()
+    l1_loss_fn = nn.MSELoss()
 
     # LPIPS (upsample to 64x64 for AlexNet compatibility)
     lpips_fn = None
@@ -209,16 +222,25 @@ def main():
             images = images.to(device)
             labels = labels.to(device)
 
-            recon, logits, z_hyp, z_euc, z_euc_dec = model(images)
+            if args.model == "hae":
+                recon, logits, z_hyp, z_euc, z_euc_dec = model(images)
+            else:
+                recon, z_euc = model(images)
+                logits = None
+                z_hyp = None
+                z_euc_dec = None
 
             # --- Losses ---
             # L1 reconstruction (replaces MSE for sharper outputs)
             loss_recon = l1_loss_fn(recon, images)
 
-            # Hyperbolic classification
-            loss_hyper = F.nll_loss(logits, labels)
+            loss = loss_recon
 
-            loss = loss_recon + lam_hyper * loss_hyper
+            # Hyperbolic classification (only for HAE)
+            loss_hyper = torch.tensor(0.0, device=device)
+            if args.model == "hae":
+                loss_hyper = F.nll_loss(logits, labels)
+                loss = loss + lam_hyper * loss_hyper
 
             # LPIPS perceptual loss (upsample to 64x64)
             loss_lpips = torch.tensor(0.0, device=device)
@@ -240,9 +262,9 @@ def main():
                 loss_ms_ssim = 1.0 - ms_ssim_fn(recon, images)
                 loss = loss + args.ms_ssim_lambda * loss_ms_ssim
 
-            # Reverse / cycle-consistency loss: MSE(z_euc, z_euc_dec)
+            # Reverse / cycle-consistency loss: MSE(z_euc, z_euc_dec) (only for HAE)
             loss_reverse = torch.tensor(0.0, device=device)
-            if args.reverse_lambda > 0:
+            if args.model == "hae" and args.reverse_lambda > 0:
                 loss_reverse = F.mse_loss(z_euc, z_euc_dec)
                 loss = loss + args.reverse_lambda * loss_reverse
 
@@ -253,31 +275,48 @@ def main():
             scheduler.step()
 
             # stats
-            pred = logits.argmax(dim=1)
-            correct += pred.eq(labels).sum().item()
-            total += labels.size(0)
+            if args.model == "hae":
+                pred = logits.argmax(dim=1)
+                correct += pred.eq(labels).sum().item()
+                total += labels.size(0)
             epoch_loss += loss.item()
             global_step += 1
 
             # --- Logging ---
             if global_step % args.log_interval == 0:
+                with torch.no_grad():
+                    z_norms = z_euc.norm(dim=-1)
+                    if z_hyp is not None:
+                        z_hyp_norms = z_hyp.norm(dim=-1)  # should stay < 1.0 in Poincaré ball
+
+                
                 lr_now = scheduler.get_last_lr()[0]
+                acc_str = f"acc={100.*correct/total:.1f}%" if args.model == "hae" else "" 
                 print(f"[Epoch {epoch+1}/{args.num_epochs}  step {global_step}]  "
                       f"loss={loss.item():.4f}  recon={loss_recon.item():.4f}  "
                       f"hyper={loss_hyper.item():.4f}  "
                       f"lpips={loss_lpips.item():.4f}  "
                       f"ssim={loss_ssim.item():.4f}  "
                       f"reverse={loss_reverse.item():.4f}  "
-                      f"acc={100.*correct/total:.1f}%  lr={lr_now:.2e}")
+                      f"{acc_str} lr={lr_now:.2e}")
+                print(f"  z_euc norm — mean: {z_norms.mean():.3f}  max: {z_norms.max():.3f}")
+                if z_hyp is not None:
+                    print(f"  z_hyp norm — mean: {z_hyp_norms.mean():.3f}  max: {z_hyp_norms.max():.3f}")
                 writer.add_scalar("train/loss", loss.item(), global_step)
                 writer.add_scalar("train/loss_recon", loss_recon.item(), global_step)
                 writer.add_scalar("train/loss_hyper", loss_hyper.item(), global_step)
                 writer.add_scalar("train/loss_lpips", loss_lpips.item(), global_step)
                 writer.add_scalar("train/loss_ssim", loss_ssim.item(), global_step)
                 writer.add_scalar("train/loss_reverse", loss_reverse.item(), global_step)
-                writer.add_scalar("train/accuracy", 100. * correct / total, global_step)
+                if args.model == "hae":
+                    writer.add_scalar("train/accuracy", 100. * correct / total, global_step)
                 writer.add_scalar("train/lr", lr_now, global_step)
                 writer.add_scalar("train/lam_hyper", lam_hyper, global_step)
+                writer.add_scalar("train/z_euc_norm_mean", z_norms.mean(), global_step)
+                writer.add_scalar("train/z_euc_norm_max", z_norms.max(), global_step)
+                if z_hyp is not None:
+                    writer.add_scalar("train/z_hyp_norm_mean", z_hyp_norms.mean(), global_step)
+                    writer.add_scalar("train/z_hyp_norm_max", z_hyp_norms.max(), global_step)
                 if args.use_wandb:
                     wandb.log({
                         "train/loss": loss.item(),
@@ -286,7 +325,7 @@ def main():
                         "train/loss_lpips": loss_lpips.item(),
                         "train/loss_ssim": loss_ssim.item(),
                         "train/loss_reverse": loss_reverse.item(),
-                        "train/accuracy": 100. * correct / total,
+                        "train/accuracy": (100. * correct / total) if args.model=="hae" else 0,
                         "train/lr": lr_now,
                         "global_step": global_step,
                     })
@@ -302,8 +341,11 @@ def main():
 
             # --- Validation ---
             if global_step % args.val_interval == 0:
-                val_loss = validate(model, test_loader, device, l1_loss_fn, writer,
+                if args.model=="hae":
+                    val_loss = validate(model, test_loader, device, l1_loss_fn, writer,
                                     global_step, lam_hyper)
+                else:
+                    val_loss = validate_ae(model, test_loader, device, l1_loss_fn, writer, global_step)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     save_checkpoint(model, optimizer, args, global_step, epoch,
@@ -320,9 +362,9 @@ def main():
                 break
 
         dt = time.time() - t0
+        acc_str = f"train_acc={100.*correct/total:.1f}%" if args.model =="hae" else ""
         print(f"Epoch {epoch+1} done in {dt:.1f}s  "
-              f"avg_loss={epoch_loss/len(train_loader):.4f}  "
-              f"train_acc={100.*correct/total:.1f}%")
+              f"avg_loss={epoch_loss/len(train_loader):.4f}  " + acc_str)
 
         if args.max_steps is not None and global_step >= args.max_steps:
             print(f"Reached max_steps={args.max_steps}, stopping.")
@@ -366,6 +408,23 @@ def validate(model, loader, device, l1_loss_fn, writer, global_step, lam_hyper):
     writer.add_scalar("val/accuracy", acc, global_step)
     return avg_loss
 
+@torch.no_grad()
+def validate_ae(model, loader, device, l1_loss_fn, writer, global_step):
+    model.eval()
+    total_loss = 0.0
+    total = 0
+
+    for images, _ in loader:
+        images = images.to(device)
+        recon, z_euc = model(images)
+        loss_recon = l1_loss_fn(recon, images)
+        total_loss += loss_recon.item() * images.size(0)
+        total += images.size(0)
+
+    avg_loss = total_loss / total
+    print(f"  [VAL step {global_step}]  loss={avg_loss:.4f}")
+    writer.add_scalar("val/loss", avg_loss, global_step)
+    return avg_loss
 
 # ---------------------------------------------------------------------------
 # Checkpoint

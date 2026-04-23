@@ -1,0 +1,30 @@
+# @package _global_
+data: images
+use_wandb: True
+
+# These MUST be overridden on the command line:
+#   python train.py experiment=cifar_hae images_datadir=/path/to/z_hyp.pt images_labels=/path/to/labels.pt
+# images_datadir: /path/to/exported/z_hyp.pt
+# images_labels: /path/to/exported/labels.pt
+
+model:
+  d_model: 512
+  num_layers: 5
+  actfn: swish
+  fourier: null
+  atol: 1e-6
+  rtol: 1e-6
+  metric_normalize: True
+
+optim:
+  num_iterations: 100000
+  batch_size: 128
+  val_batch_size: 2000
+  lr: 1e-4
+
+val_every: 1000
+div_mode: rademacher
+eval_projx: False
+local_coords: False
+normalize_loglik: False
+visualize: False
