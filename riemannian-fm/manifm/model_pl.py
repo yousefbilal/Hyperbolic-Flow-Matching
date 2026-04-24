@@ -20,6 +20,7 @@ from torchdiffeq import odeint
 from manifm.datasets import get_manifold
 from manifm.ema import EMA
 from manifm.model.arch import tMLP, ProjectToTangent, Unbatch
+from manifm.model.cond_arch import tMLP_cond, ConditionalVecfield
 from manifm.utils import lonlat_from_cartesian, cartesian_from_latlon
 from manifm.manifolds import (
     Sphere,
@@ -60,23 +61,52 @@ class ManifoldFMLitModule(pl.LightningModule):
 
         self.manifold, self.dim = get_manifold(cfg)
 
-        # Model of the vector field.
-        self.model = EMA(
-            Unbatch(  # Ensures vmap works.
-                ProjectToTangent(  # Ensures we can just use Euclidean divergence.
-                    tMLP(  # Vector field in the ambient space.
-                        self.dim,
-                        d_model=cfg.model.d_model,
-                        num_layers=cfg.model.num_layers,
-                        actfn=cfg.model.actfn,
-                        fourier=cfg.model.get("fourier", None),
-                    ),
+        # CFG conditioning knobs (default off).
+        self.fm_conditioning = str(cfg.get("fm_conditioning", "none"))
+        self.num_classes = int(cfg.get("num_classes", 0))
+        self.cfg_label_dropout = float(cfg.get("cfg_label_dropout", 0.1))
+        self.cfg_cond_dim = int(cfg.get("cfg_cond_dim", 64))
+
+        if self.fm_conditioning == "cfg":
+            assert self.num_classes > 0, "cfg requires num_classes > 0"
+            inner_cond = tMLP_cond(
+                self.dim,
+                d_model=cfg.model.d_model,
+                num_layers=cfg.model.num_layers,
+                actfn=cfg.model.actfn,
+                fourier=cfg.model.get("fourier", None),
+                cond_dim=self.cfg_cond_dim,
+            )
+            wrapped = Unbatch(
+                ProjectToTangent(
+                    inner_cond,
                     manifold=self.manifold,
                     metric_normalize=self.cfg.model.get("metric_normalize", False),
                 )
-            ),
-            cfg.optim.ema_decay,
-        )
+            )
+            cond_model = ConditionalVecfield(
+                wrapped, inner_cond,
+                num_classes=self.num_classes,
+                cond_dim=self.cfg_cond_dim,
+            )
+            self.model = EMA(cond_model, cfg.optim.ema_decay)
+        else:
+            self.model = EMA(
+                Unbatch(
+                    ProjectToTangent(
+                        tMLP(
+                            self.dim,
+                            d_model=cfg.model.d_model,
+                            num_layers=cfg.model.num_layers,
+                            actfn=cfg.model.actfn,
+                            fourier=cfg.model.get("fourier", None),
+                        ),
+                        manifold=self.manifold,
+                        metric_normalize=self.cfg.model.get("metric_normalize", False),
+                    )
+                ),
+                cfg.optim.ema_decay,
+            )
 
         # use separate metric instance for train, val and test step
         # to ensure a proper reduction over the epoch
@@ -385,7 +415,7 @@ class ManifoldFMLitModule(pl.LightningModule):
         return self.manifold.dist(x0, x1)
 
     @torch.no_grad()
-    def sample(self, n_samples, device, x0=None):
+    def sample(self, n_samples, device, x0=None, labels=None, cfg_scale=1.0):
         if x0 is None:
             # Sample from base distribution.
             x0 = (
@@ -397,11 +427,35 @@ class ManifoldFMLitModule(pl.LightningModule):
         local_coords = self.cfg.get("local_coords", False)
         eval_projx = self.cfg.get("eval_projx", False)
 
+        # Select the vector field callable used by the ODE integrator.
+        if self.fm_conditioning == "cfg":
+            B = x0.shape[0]
+            if labels is not None:
+                labels = labels.to(device=device, dtype=torch.long)
+                if labels.numel() == 1:
+                    labels = labels.expand(B)
+            null_labels = torch.full((B,), self.num_classes,
+                                     dtype=torch.long, device=device)
+
+            if labels is None:
+                # Unconditional sampling under a CFG-trained model.
+                vecfield_call = lambda t, x: self.vecfield(t, x, null_labels)
+            elif abs(float(cfg_scale) - 1.0) < 1e-8:
+                vecfield_call = lambda t, x: self.vecfield(t, x, labels)
+            else:
+                w = float(cfg_scale)
+
+                def vecfield_call(t, x):
+                    v_c = self.vecfield(t, x, labels)
+                    v_u = self.vecfield(t, x, null_labels)
+                    return v_u + w * (v_c - v_u)
+        else:
+            vecfield_call = self.vecfield
+
         # Solve ODE.
         if not eval_projx and not local_coords:
-            # If no projection, use adaptive step solver.
             x1 = odeint(
-                self.vecfield,
+                vecfield_call,
                 x0,
                 t=torch.linspace(0, 1, 2).to(device),
                 atol=self.cfg.model.atol,
@@ -409,10 +463,9 @@ class ManifoldFMLitModule(pl.LightningModule):
                 options={"min_step": 1e-5}
             )[-1]
         else:
-            # If projection, use 1000 steps.
             x1 = projx_integrator_return_last(
                 self.manifold,
-                self.vecfield,
+                vecfield_call,
                 x0,
                 t=torch.linspace(0, 1, 1001).to(device),
                 method="euler",
@@ -421,7 +474,6 @@ class ManifoldFMLitModule(pl.LightningModule):
                 pbar=True,
             )
 
-        # SCALING - was commented before
         x1 = self.manifold.projx(x1)
         return x1
 
@@ -630,7 +682,32 @@ class ManifoldFMLitModule(pl.LightningModule):
             # x_t = torch.cat(x_t_list, dim=0)  # [N, dim]
             # u_t = torch.cat(u_t_list, dim=0)
 
-        diff = self.vecfield(t, x_t) - u_t
+        if self.fm_conditioning == "cfg":
+            labels = None
+            if isinstance(batch, dict) and "label" in batch:
+                labels = batch["label"].to(x1.device).long()
+            if labels is None:
+                labels = torch.full((N,), self.num_classes,
+                                    dtype=torch.long, device=x1.device)
+            else:
+                # -1 → null token
+                labels = torch.where(
+                    labels < 0,
+                    torch.full_like(labels, self.num_classes),
+                    labels,
+                )
+                if self.training and self.cfg_label_dropout > 0:
+                    drop = torch.rand(labels.shape, device=labels.device) < self.cfg_label_dropout
+                    labels = torch.where(
+                        drop, torch.full_like(labels, self.num_classes), labels,
+                    )
+            # x_t, u_t may be repeated T times for Mesh; match.
+            if labels.shape[0] != x_t.shape[0]:
+                rep = x_t.shape[0] // labels.shape[0]
+                labels = labels.repeat_interleave(rep)
+            diff = self.vecfield(t, x_t, labels) - u_t
+        else:
+            diff = self.vecfield(t, x_t) - u_t
         return self.manifold.inner(x_t, diff, diff).mean() / self.dim
 
     def training_step(self, batch: Any, batch_idx: int):

@@ -38,12 +38,36 @@ class AblationConfig:
     reverse_lambda: float = 0.0
     ms_ssim_lambda: float = 0.0
 
+    # --- Imbalance handling ------------------------------------------------
+    # Sampler: instance (natural) | balanced (1/n_c) | sqrt (1/sqrt(n_c))
+    sampler: str = "instance"
+    # Class-weighted NLL: none | inv_freq | effective_number
+    class_weighting: str = "none"
+    eff_num_beta: float = 0.9999
+
+    # --- Contrastive loss (hyperbolic) ------------------------------------
+    # none              = standard NLL head only (current behaviour)
+    # supcon_hyp        = supervised contrastive w/ Poincaré distance kernel
+    # align_unif_hyp    = alignment + uniformity on the ball (freq-free, unsup negatives)
+    # supcon_hyp_radius = supcon + per-class radius prior ‖z_c‖ ∝ log(N_max/n_c)
+    contrastive_mode: str = "none"
+    contrastive_lambda: float = 0.0
+    contrastive_tau: float = 0.5
+    radius_prior_lambda: float = 0.0    # only used when contrastive_mode = *_radius
+
+    # --- Encoder backbone (for ImageNet-LT) -------------------------------
+    # cnn_cifar   = small CIFAR CNN (current)
+    # sd_vae      = frozen Stable Diffusion KL-f8 VAE (ImageNet-LT only)
+    encoder_backbone: str = "cnn_cifar"
+    # How to collapse SD-VAE's 4xH/8xW/8 spatial latent → flat vector
+    # flatten | mean_pool | cls_token
+    sd_vae_pool: str = "mean_pool"
+
     # --- Class conditioning in FM -----------------------------------------
-    # none        = unconditional FM
-    # conditional = class embedding added to time embedding
-    # cfg         = classifier-free guidance with 10% label dropout
+    # none = unconditional FM
+    # cfg  = classifier-free guidance with 10% label dropout (Ho & Salimans 2022)
     fm_conditioning: str = "none"
-    cfg_scale: float = 1.0              # only when fm_conditioning=cfg
+    cfg_scale: float = 1.0              # inference-time guidance strength
     cfg_label_dropout: float = 0.1
 
     # --- Training ----------------------------------------------------------
@@ -84,9 +108,11 @@ def geometry_sweep() -> List[AblationConfig]:
 
 
 def curvature_sweep() -> List[AblationConfig]:
-    """§3.2 — Curvature sweep."""
-    vals = [0.1, 0.5, 1.0, 2.0, 3.0]
-    return [AblationConfig(curvature=-c, name=f"curv_{c}") for c in vals]
+    """§3.2 — Curvature sweep. curvature=0 = Euclidean baseline via GeometryHead."""
+    cfgs = [AblationConfig(curvature=0.0, name="curv_euclidean")]
+    for c in [0.1, 0.5, 1.0, 2.0, 3.0]:
+        cfgs.append(AblationConfig(curvature=-c, name=f"curv_{c}"))
+    return cfgs
 
 
 def imbalance_sweep() -> List[AblationConfig]:
@@ -104,11 +130,8 @@ def hyper_lambda_sweep() -> List[AblationConfig]:
 
 
 def conditioning_sweep() -> List[AblationConfig]:
-    """§3.5 — Class conditioning in FM."""
-    cfgs = [
-        AblationConfig(fm_conditioning="none", name="cond_none"),
-        AblationConfig(fm_conditioning="conditional", name="cond_class"),
-    ]
+    """§3.5 — Class conditioning in FM. Only CFG vs unconditional."""
+    cfgs = [AblationConfig(fm_conditioning="none", name="cond_none")]
     for w in [1.0, 2.0, 4.0, 7.5]:
         cfgs.append(AblationConfig(
             fm_conditioning="cfg", cfg_scale=w, name=f"cfg_w{w}"
@@ -128,6 +151,62 @@ def reverse_lambda_sweep() -> List[AblationConfig]:
     return [AblationConfig(reverse_lambda=v, name=f"rev_{v}") for v in vals]
 
 
+def sampler_sweep() -> List[AblationConfig]:
+    """§3.8 — Resampling strategies for long-tail."""
+    return [AblationConfig(sampler=s, name=f"samp_{s}")
+            for s in ["instance", "sqrt", "balanced"]]
+
+
+def class_weighting_sweep() -> List[AblationConfig]:
+    """§3.9 — Frequency-weighted NLL variants."""
+    cfgs = [AblationConfig(class_weighting="none", name="cw_none"),
+            AblationConfig(class_weighting="inv_freq", name="cw_inv_freq")]
+    for b in [0.99, 0.999, 0.9999]:
+        cfgs.append(AblationConfig(class_weighting="effective_number",
+                                   eff_num_beta=b, name=f"cw_eff_{b}"))
+    return cfgs
+
+
+def contrastive_sweep() -> List[AblationConfig]:
+    """§3.10 — Hyperbolic contrastive AS AN ALTERNATIVE to the NLL head.
+
+    In each non-baseline config we zero out hyperbolic_lambda so the
+    contrastive term is the *only* class-separation signal — otherwise the
+    comparison is confounded by NLL still training in parallel.
+
+    First three modes are frequency-free; supcon_hyp_radius uses class counts
+    to place heads near origin and tails near the ball boundary.
+    """
+    base_lam = 0.1
+    cfgs = [AblationConfig(contrastive_mode="none", name="con_none")]
+    for m in ["supcon_hyp", "align_unif_hyp", "supcon_hyp_radius"]:
+        cfgs.append(AblationConfig(
+            contrastive_mode=m,
+            contrastive_lambda=base_lam,
+            radius_prior_lambda=(0.05 if m.endswith("_radius") else 0.0),
+            hyperbolic_lambda=0.0,          # disable NLL head — alternative, not additive
+            name=f"con_{m}",
+        ))
+    return cfgs
+
+
+def encoder_backbone_sweep() -> List[AblationConfig]:
+    """§3.11 — Encoder choice.
+
+    cnn_cifar is used for CIFAR-LT; sd_vae (flatten) is used for ImageNet-LT.
+    mean_pool / cls_token would require a learned upsampler back to the VAE's
+    (4, 32, 32) spatial latent before the frozen decoder — left as future work.
+    """
+    return [
+        AblationConfig(dataset="cifar10",     encoder_backbone="cnn_cifar",
+                       name="enc_cnn_cifar"),
+        AblationConfig(dataset="imagenet_lt", encoder_backbone="sd_vae",
+                       sd_vae_pool="flatten",
+                       hae_batch_size=64, hae_epochs=40,
+                       name="enc_sdvae_imagenet"),
+    ]
+
+
 ALL_SWEEPS = {
     "geometry": geometry_sweep,
     "curvature": curvature_sweep,
@@ -136,4 +215,8 @@ ALL_SWEEPS = {
     "conditioning": conditioning_sweep,
     "latent_dim": latent_dim_sweep,
     "reverse_lambda": reverse_lambda_sweep,
+    "sampler": sampler_sweep,
+    "class_weighting": class_weighting_sweep,
+    "contrastive": contrastive_sweep,
+    "encoder_backbone": encoder_backbone_sweep,
 }
