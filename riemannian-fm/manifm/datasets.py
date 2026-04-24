@@ -659,12 +659,6 @@ def _get_dataset(cfg):
             centers=centers,
             dataset_size=10000,
         )
-    elif cfg.data == "eeg_1":
-        dataset = EEG(cfg.eeg_datadir, set="1", Riem_geodesic=cfg.eeg.Riem_geodesic, Riem_norm=cfg.eeg.Riem_norm)
-    elif cfg.data == "eeg_2a":
-        dataset = EEG(cfg.eeg_datadir, set="2a", Riem_geodesic=cfg.eeg.Riem_geodesic, Riem_norm=cfg.eeg.Riem_norm)
-    elif cfg.data == "eeg_2b":
-        dataset = EEG(cfg.eeg_datadir, set="2b", Riem_geodesic=cfg.eeg.Riem_geodesic, Riem_norm=cfg.eeg.Riem_norm)
     elif cfg.data == "hyperbolic":
         dataset = HyperbolicDatasetPair()
     elif cfg.data == "images":
