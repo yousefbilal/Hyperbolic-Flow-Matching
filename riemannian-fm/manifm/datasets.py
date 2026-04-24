@@ -281,22 +281,23 @@ class HyperbolicImages(Dataset):
     def __getitem__(self, idx, dim=512):
 
         x1 = self.emb[idx].reshape(-1)
+        label = int(self.labels[idx].item()) if self.labels is not None else -1
 
         if self.pair_mode == "none":
-            return {"x1": x1}
+            return {"x1": x1, "label": label}
 
         if self.pair_mode == "self":
             # Uniform distribution from VRFM
             #x0 = 2*torch.rand(dim) - 1
             #x0 = PoincareBallManifold().wrap(x0)
             x0 = self.manifold.wrapped_normal(self.dim, mean=torch.zeros(self.dim), std=0.3)
-            return {"x0": x0, "x1": x1}
+            return {"x0": x0, "x1": x1, "label": label}
 
         # Pair two different embeddings (e.g., across classes)
         if self.pair_mode == "paired":
             j = torch.randint(0, len(self.emb), (1,)).item()
             x0 = self.emb[j]
-            return {"x0": x0, "x1": x1}
+            return {"x0": x0, "x1": x1, "label": label}
 
 
 class EuclideanImages(Dataset):
@@ -337,7 +338,8 @@ class EuclideanImages(Dataset):
 
         x1 = self.emb[idx]
         x0 = self.manifold.random_normal(self.dim, mean=torch.zeros(self.dim), std=1.0)
-        return {"x0": x0, "x1": x1}
+        label = int(self.labels[idx].item()) if self.labels is not None else -1
+        return {"x0": x0, "x1": x1, "label": label}
             
 '''
 class HyperbolicImages(Dataset):
@@ -672,6 +674,8 @@ def _get_dataset(cfg):
         dataset = HyperbolicUniformToGaussian()
     elif cfg.data == "euclidean":
         dataset = EuclideanImages(cfg.get("euclidean_datadir"))
+    elif cfg.data == "euclidean_images":
+        dataset = EuclideanImages(cfg.get("images_datadir"), cfg.get("images_labels"))
     else:
         raise ValueError("Unknown dataset option '{name}'")
     return dataset, expand_factor

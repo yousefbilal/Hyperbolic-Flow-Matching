@@ -1,18 +1,12 @@
 #!/usr/bin/env python
-"""End-to-end CIFAR image generation via Riemannian Flow Matching.
+"""End-to-end image generation via RFM + HAE decoder.
 
-Pipeline:
-    1. Load trained RFM → sample z_hyp on the Poincaré ball
-    2. Load trained HAE → logmap0(z_hyp) → CNN decoder → images
-    3. Save images as a grid / individual PNGs
+Dispatches on the HAE checkpoint's saved `dataset`:
+  - cifar10/cifar100 → HAECifar's CNN decoder (32x32 images)
+  - imagenet_lt      → HAEImageNet's proj_dec + frozen SD-VAE decode (256x256)
 
-Usage:
-    conda activate dl
-    python generate_cifar.py \\
-        --rfm_checkpoint outputs/runs/.../checkpoints/last.ckpt \\
-        --hae_checkpoint ../HAE/experiments/cifar10_c1/checkpoints/best_model.pt \\
-        --n_samples 64 \\
-        --output_dir ./generated_cifar
+Skips logmap0 when the saved curvature is ~0 (Euclidean baseline).
+Supports CFG-conditional sampling via --class_id and --cfg_scale.
 """
 
 import argparse
@@ -23,51 +17,88 @@ import torch
 import geoopt.manifolds.stereographic.math as gmath
 from torchvision.utils import save_image
 
-# Add project roots to path
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "HAE"))
 
 from manifm.eval_utils import load_model
 
 
+EUCLIDEAN_EPS = 1e-6
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Generate CIFAR images from RFM + HAE")
-    p.add_argument("--rfm_checkpoint", type=str, required=True,
-                   help="Path to the RFM Lightning checkpoint (.ckpt)")
-    p.add_argument("--hae_checkpoint", type=str, required=True,
-                   help="Path to the HAE-CIFAR checkpoint (.pt)")
+    p = argparse.ArgumentParser(description="Generate images from RFM + HAE")
+    p.add_argument("--rfm_checkpoint", type=str, required=True)
+    p.add_argument("--hae_checkpoint", type=str, required=True)
     p.add_argument("--n_samples", type=int, default=64)
-    p.add_argument("--output_dir", type=str, default="./generated_cifar")
+    p.add_argument("--output_dir", type=str, default="./generated")
     p.add_argument("--curvature", type=float, default=-1.0,
                    help="Must match the curvature used during HAE training")
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--nrow", type=int, default=8,
-                   help="Number of images per row in the saved grid")
+    p.add_argument("--nrow", type=int, default=8)
+    p.add_argument("--class_id", type=str, default=None,
+                   help="Single int or comma list of class indices "
+                        "(length 1 or n_samples). Omit for unconditional.")
+    p.add_argument("--cfg_scale", type=float, default=1.0)
     return p.parse_args()
 
 
-def load_hae_decoder(checkpoint_path, device):
-    """Load only the decoder portion of a trained HAE-CIFAR model."""
-    from models.hae_cifar import HAECifar
-
+def load_hae(checkpoint_path, device):
+    """Load the full HAE model (CIFAR or ImageNet) so we have encoder+decoder."""
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     saved_args = ckpt.get("args", {})
+    dataset = saved_args.get("dataset", "cifar10")
+    curvature = float(saved_args.get("curvature", -1.0))
+    latent_dim = saved_args.get("latent_dim", 512)
+    feature_size = saved_args.get("feature_size", 512)
 
-    num_classes = saved_args.get("num_classes", 10)
-    # Infer num_classes from the MLR weight shape if available
     sd = ckpt["state_dict"]
-    if "mlr.a_vals" in sd:
-        num_classes = sd["mlr.a_vals"].shape[0]
 
-    model = HAECifar(
-        num_classes=num_classes,
-        latent_dim=saved_args.get("latent_dim", 512),
-        feature_size=saved_args.get("feature_size", 512),
-        curvature=saved_args.get("curvature", -1.0),
-    )
+    if dataset in ("cifar10", "cifar100"):
+        from models.hae_cifar import HAECifar
+        num_classes = 10 if dataset == "cifar10" else 100
+        model = HAECifar(num_classes=num_classes, latent_dim=latent_dim,
+                         feature_size=feature_size, curvature=curvature)
+    elif dataset == "imagenet_lt":
+        from models.hae_imagenet import HAEImageNet
+        # Infer num_classes from checkpoint. Euclidean head → classifier.weight;
+        # hyperbolic head → mlr.a_vals.
+        num_classes = 1000
+        if "head.classifier.weight" in sd:
+            num_classes = sd["head.classifier.weight"].shape[0]
+        elif "head.mlr.a_vals" in sd:
+            num_classes = sd["head.mlr.a_vals"].shape[0]
+        model = HAEImageNet(num_classes=num_classes, latent_dim=latent_dim,
+                            feature_size=feature_size, curvature=curvature)
+    else:
+        raise ValueError(f"Unknown HAE dataset: {dataset}")
+
     model.load_state_dict(sd)
     model = model.to(device).eval()
-    return model
+    return model, dataset, curvature
+
+
+def decode(model, dataset, z_euc_dec):
+    """Map Euclidean feature back to image space (32x32 for CIFAR, 256x256 for ImageNet)."""
+    if dataset in ("cifar10", "cifar100"):
+        return model.decoder(z_euc_dec)
+    # imagenet_lt
+    B = z_euc_dec.shape[0]
+    z_flat = model.proj_dec(z_euc_dec)
+    z_spatial = z_flat.reshape(B, model.channels, model.spatial, model.spatial)
+    return model.vae.decode(z_spatial)
+
+
+def parse_class_id(s, n_samples, device):
+    if s is None:
+        return None
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    ids = [int(p) for p in parts]
+    if len(ids) == 1:
+        return torch.full((n_samples,), ids[0], dtype=torch.long, device=device)
+    assert len(ids) == n_samples, (
+        f"class_id list length {len(ids)} must match n_samples {n_samples}")
+    return torch.tensor(ids, dtype=torch.long, device=device)
 
 
 def main():
@@ -75,37 +106,46 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     curvature = torch.tensor(args.curvature, dtype=torch.float32)
+    is_euclidean = abs(float(args.curvature)) < EUCLIDEAN_EPS
 
-    # ---- 1. Load RFM and generate hyperbolic latents ----------------------
+    # ---- 1. Load RFM and sample latents -----------------------------------
     print(f"Loading RFM from: {args.rfm_checkpoint}")
     cfg, rfm_model = load_model(args.rfm_checkpoint)
     rfm_model = rfm_model.to(device).eval()
 
-    print(f"Sampling {args.n_samples} latents on the Poincaré ball...")
+    labels = parse_class_id(args.class_id, args.n_samples, device)
+
+    print(f"Sampling {args.n_samples} latents "
+          f"(class_id={args.class_id}, cfg_scale={args.cfg_scale})...")
     with torch.no_grad():
-        z_hyp = rfm_model.sample(args.n_samples, device=device)
+        z_hyp = rfm_model.sample(args.n_samples, device=device,
+                                 labels=labels, cfg_scale=args.cfg_scale)
 
     norms = z_hyp.norm(dim=-1)
-    print(f"  z_hyp shape: {z_hyp.shape}")
-    print(f"  Norm stats: min={norms.min():.4f}  max={norms.max():.4f}  "
+    print(f"  z_hyp shape: {z_hyp.shape}  "
+          f"norm min={norms.min():.4f} max={norms.max():.4f} "
           f"mean={norms.mean():.4f}")
 
     # ---- 2. Load HAE decoder and produce images ---------------------------
-    print(f"Loading HAE decoder from: {args.hae_checkpoint}")
-    hae_model = load_hae_decoder(args.hae_checkpoint, device)
+    print(f"Loading HAE from: {args.hae_checkpoint}")
+    hae_model, dataset, saved_k = load_hae(args.hae_checkpoint, device)
+    saved_is_euclidean = abs(saved_k) < EUCLIDEAN_EPS
+    if saved_is_euclidean != is_euclidean:
+        print(f"  WARNING: --curvature={args.curvature} vs saved curvature "
+              f"{saved_k}. Using saved flag for logmap0 bypass.")
 
     with torch.no_grad():
-        z_euc = gmath.logmap0(z_hyp.float(), k=curvature)
-        images = hae_model.decoder(z_euc)   # (N, 3, 32, 32) in [-1, 1]
+        z = z_hyp.float()
+        if not saved_is_euclidean:
+            z = gmath.logmap0(z, k=curvature)
+        images = decode(hae_model, dataset, z)
 
     # ---- 3. Save ----------------------------------------------------------
-    # Grid
     grid_path = os.path.join(args.output_dir, "generated_grid.png")
     save_image(images, grid_path, nrow=args.nrow, normalize=True,
                value_range=(-1, 1))
     print(f"  Saved grid → {grid_path}")
 
-    # Individual images
     img_dir = os.path.join(args.output_dir, "images")
     os.makedirs(img_dir, exist_ok=True)
     for i in range(images.size(0)):
@@ -113,7 +153,6 @@ def main():
                    normalize=True, value_range=(-1, 1))
     print(f"  Saved {images.size(0)} individual images → {img_dir}")
 
-    # Save raw latents for diagnostic plots
     torch.save(z_hyp.cpu(), os.path.join(args.output_dir, "z_hyp_generated.pt"))
     print("Done.")
 
