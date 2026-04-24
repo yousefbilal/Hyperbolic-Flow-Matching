@@ -1,16 +1,15 @@
 # @package _global_
-data: images
+# CIFAR-LT Euclidean baseline (HAECifar with curvature=0).
+data: euclidean_images
 use_wandb: True
 
+# Override on CLI:
+#   images_datadir=/path/to/z_hyp.pt images_labels=/path/to/labels.pt
+
 num_classes: 10
-fm_conditioning: none           # none | cfg
+fm_conditioning: none
 cfg_label_dropout: 0.1
 cfg_cond_dim: 64
-
-# These MUST be overridden on the command line:
-#   python train.py experiment=cifar_hae images_datadir=/path/to/z_hyp.pt images_labels=/path/to/labels.pt
-# images_datadir: /path/to/exported/z_hyp.pt
-# images_labels: /path/to/exported/labels.pt
 
 model:
   d_model: 512
@@ -19,7 +18,7 @@ model:
   fourier: null
   atol: 1e-6
   rtol: 1e-6
-  metric_normalize: True
+  metric_normalize: False   # Euclidean: no metric-normalised vecfield
 
 optim:
   num_iterations: 100000
