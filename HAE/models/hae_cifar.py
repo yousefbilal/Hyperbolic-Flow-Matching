@@ -104,17 +104,12 @@ class HAECifar(nn.Module):
         # Map to Poincaré ball
         z_hyp = self.hyperbolic_linear(z_euc)
 
-# Safety clamp: keep points away from the absolute edge (1.0)
-        norm = z_hyp.norm(dim=-1, keepdim=True)
-        max_norm = 0.95 # Stay slightly away from the boundary
-        cond = norm > max_norm
-        z_hyp_clamped = torch.where(cond, z_hyp * (max_norm / (norm + 1e-6)), z_hyp)
 
-        logits = F.log_softmax(self.mlr(z_hyp_clamped, self.mlr.c), dim=-1)
-        z_euc_dec = gmath.logmap0(z_hyp_clamped, k=self.curvature)
+        logits = F.log_softmax(self.mlr(z_hyp, self.mlr.c), dim=-1)
+        z_euc_dec = gmath.logmap0(z_hyp, k=self.curvature)
         recon = self.decoder(z_euc_dec)              # (B, 3, 32, 32)
 
-        return recon, logits, z_hyp_clamped, z_euc, z_euc_dec
+        return recon, logits, z_hyp, z_euc, z_euc_dec
 
 
 if __name__ == "__main__":
