@@ -1,0 +1,31 @@
+# @package _global_
+# ImageNet-LT hyperbolic RFM (HAEImageNet with SD-VAE + Möbius head).
+data: images
+use_wandb: True
+
+num_classes: 1000
+fm_conditioning: none
+cfg_label_dropout: 0.1
+cfg_cond_dim: 128
+
+model:
+  d_model: 512
+  num_layers: 5
+  actfn: swish
+  fourier: null
+  atol: 1e-6
+  rtol: 1e-6
+  metric_normalize: True
+
+optim:
+  num_iterations: 200000
+  batch_size: 64
+  val_batch_size: 1000
+  lr: 1e-4
+
+val_every: 2000
+div_mode: rademacher
+eval_projx: False
+local_coords: False
+normalize_loglik: False
+visualize: False

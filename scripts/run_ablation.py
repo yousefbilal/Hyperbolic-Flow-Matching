@@ -90,7 +90,7 @@ def run_experiment(cfg: AblationConfig, args):
     # ---- Step 1: Train HAE ------------------------------------------------
     if not args.skip_hae:
         hae_cmd = [
-            sys.executable, "scripts/train_hae_cifar.py",
+            sys.executable, "scripts/train_hae.py",
             "--dataset", cfg.dataset,
             "--imbalance_factor", str(cfg.imbalance_factor),
             "--curvature", str(cfg.curvature),
@@ -102,6 +102,13 @@ def run_experiment(cfg: AblationConfig, args):
             "--num_epochs", str(cfg.hae_epochs),
             "--batch_size", str(cfg.hae_batch_size),
             "--lr", str(cfg.hae_lr),
+            "--sampler", cfg.sampler,
+            "--class_weighting", cfg.class_weighting,
+            "--eff_num_beta", str(cfg.eff_num_beta),
+            "--contrastive_mode", cfg.contrastive_mode,
+            "--contrastive_lambda", str(cfg.contrastive_lambda),
+            "--contrastive_tau", str(cfg.contrastive_tau),
+            "--radius_prior_lambda", str(cfg.radius_prior_lambda),
             "--exp_dir", hae_exp,
             "--data_root", args.data_root,
         ]
@@ -127,14 +134,26 @@ def run_experiment(cfg: AblationConfig, args):
             return
 
     # ---- Step 3: Train RFM -----------------------------------------------
+    is_euclidean = abs(float(cfg.curvature)) < 1e-6
+    is_imagenet = cfg.dataset == "imagenet_lt"
+    if is_imagenet:
+        exp_name_rfm = "imagenet_hae_euclidean" if is_euclidean else "imagenet_hae"
+    else:
+        exp_name_rfm = "cifar_hae_euclidean" if is_euclidean else "cifar_hae"
+    num_classes = {"cifar10": 10, "cifar100": 100, "imagenet_lt": 1000}.get(
+        cfg.dataset, 10)
+
     if not args.skip_rfm:
         z_hyp_path = os.path.join(emb_dir, "z_hyp.pt")
         labels_path = os.path.join(emb_dir, "labels.pt")
         rfm_cmd = [
             sys.executable, "train.py",
-            "experiment=cifar_hae",
+            f"experiment={exp_name_rfm}",
             f"images_datadir={z_hyp_path}",
             f"images_labels={labels_path}",
+            f"num_classes={num_classes}",
+            f"fm_conditioning={cfg.fm_conditioning}",
+            f"cfg_label_dropout={cfg.cfg_label_dropout}",
             f"optim.num_iterations={cfg.rfm_iterations}",
             f"optim.batch_size={cfg.rfm_batch_size}",
             f"optim.lr={cfg.rfm_lr}",
@@ -155,6 +174,7 @@ def run_experiment(cfg: AblationConfig, args):
             "--n_samples", "1000",
             "--output_dir", gen_dir,
             "--curvature", str(cfg.curvature),
+            "--cfg_scale", str(cfg.cfg_scale),
         ]
         rc = run_cmd(gen_cmd, cwd=rfm_dir, dry_run=args.dry_run)
 
