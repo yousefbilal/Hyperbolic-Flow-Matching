@@ -5,8 +5,9 @@ tensorboard
 wandb
 umap-learn
 torchmetrics
-meshplot
 matplotlib
 jupyter
 torchdiffeq
 scikit-learn
+diffusers
+accelerate
