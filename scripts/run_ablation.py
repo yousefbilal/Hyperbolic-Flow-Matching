@@ -23,7 +23,7 @@ import subprocess
 import sys
 from datetime import datetime
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "HAE"))
 from configs.ablation_config import AblationConfig, ALL_SWEEPS
 
 
@@ -37,10 +37,10 @@ def parse_args():
     p.add_argument("--base_exp_dir", type=str, required=True)
     p.add_argument("--data_root", type=str, default="./data")
     p.add_argument("--rfm_dir", type=str,
-                   default=os.path.join(os.path.dirname(__file__), "..", "..", "riemannian-fm"),
+                   default=os.path.join(os.path.dirname(__file__), "..", "riemannian-fm"),
                    help="Path to riemannian-fm/ directory")
     p.add_argument("--hae_dir", type=str,
-                   default=os.path.join(os.path.dirname(__file__), ".."),
+                   default=os.path.join(os.path.dirname(__file__), "..", "HAE"),
                    help="Path to HAE/ directory")
     p.add_argument("--skip_hae", action="store_true", help="Skip HAE training")
     p.add_argument("--skip_rfm", action="store_true", help="Skip RFM training")
