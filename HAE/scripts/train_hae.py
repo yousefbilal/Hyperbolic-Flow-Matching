@@ -63,7 +63,7 @@ def parse_args():
                         "is already imbalanced on disk)")
     p.add_argument("--image_size", type=int, default=None,
                    help="Override input size (default: 32 for CIFAR, 256 for ImageNet-LT)")
-    p.add_argument("--data_root", type=str, default="./data")
+    p.add_argument("--data_root", type=str, default="../data")
 
     # model
     p.add_argument("--latent_dim", type=int, default=512)
