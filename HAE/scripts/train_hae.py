@@ -117,6 +117,8 @@ def parse_args():
                    help="Weight of reverse/cycle-consistency loss MSE(z_euc, z_euc_dec) (0 = off)")
     p.add_argument("--ms_ssim_lambda", type=float, default=0.0,
                    help="Weight of MS-SSIM perceptual loss (0 = off, needs kernel_size tuning)")
+    p.add_argument("--lpips_bb", type=str, default="alex",
+                   choices=["alex", "vgg", "squeeze"])
 
     # logging / checkpoints
     p.add_argument("--exp_dir", type=str, required=True)
@@ -305,11 +307,10 @@ def main():
     # ---- Losses -----------------------------------------------------------
     l1_loss_fn = nn.MSELoss()
 
-    # LPIPS (upsample to 64x64 for AlexNet compatibility)
     lpips_fn = None
     if args.lpips_lambda > 0:
         from criteria.lpips.lpips import LPIPS
-        lpips_fn = LPIPS(net_type='alex', device=str(device)).to(device).eval()
+        lpips_fn = LPIPS(net_type=args.lpips_bb, device=str(device)).to(device).eval()
 
     # Single-scale SSIM (works at 32x32 natively)
     ssim_fn = None
