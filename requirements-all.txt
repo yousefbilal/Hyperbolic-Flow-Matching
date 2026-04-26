@@ -1,0 +1,13 @@
+geoopt
+libigl
+opencv-python
+tensorboard
+wandb
+umap-learn
+torchmetrics
+matplotlib
+jupyter
+torchdiffeq
+scikit-learn
+diffusers
+accelerate
