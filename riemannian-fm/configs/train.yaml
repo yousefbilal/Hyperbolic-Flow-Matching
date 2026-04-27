@@ -6,10 +6,10 @@ defaults:
   - override hydra/hydra_logging: colorlog
 
 data: euclidean  # {volcano,earthquake,fire,flood}
-earth_datadir: /checkpoint/${oc.env:USER}/data/earth_data
-rna_datadir: /checkpoint/${oc.env:USER}/data/rna
-top500_datadir: /checkpoint/${oc.env:USER}/data/top500
-mesh_datadir: /checkpoint/${oc.env:USER}/data/mesh
+earth_datadir: /checkpoint/${oc.env:USER,unknown}/data/earth_data
+rna_datadir: /checkpoint/${oc.env:USER,unknown}/data/rna
+top500_datadir: /checkpoint/${oc.env:USER,unknown}/data/top500
+mesh_datadir: /checkpoint/${oc.env:USER,unknown}/data/mesh
 data_seed: null  # seed for creating the data splits. By default, uses global seed.
 #euclidean_datadir: /home/fvaleau/HAE/proj/umap_flowers/euc_embed_tv
 euclidean_datadir: /home/fvaleau/HAE/proj/animals_emb_1/euc_embed_flat

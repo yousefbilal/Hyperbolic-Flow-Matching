@@ -57,8 +57,11 @@ def load_hae(checkpoint_path, device):
     if dataset in ("cifar10", "cifar100"):
         from models.hae_cifar import HAECifar
         num_classes = 10 if dataset == "cifar10" else 100
+        # Match VAE/AE config from training (different encoder weight names)
+        variational = float(saved_args.get("kl_lambda", 0.0)) > 0.0
         model = HAECifar(num_classes=num_classes, latent_dim=latent_dim,
-                         feature_size=feature_size, curvature=curvature)
+                         feature_size=feature_size, curvature=curvature,
+                         variational=variational)
     elif dataset == "imagenet_lt":
         from models.hae_imagenet import HAEImageNet
         # Infer num_classes from checkpoint. Euclidean head → classifier.weight;

@@ -139,11 +139,22 @@ class CIFAREncoder(nn.Module):
         DownBlock 64→128   (16×16)
         DownBlock 128→256  (8×8)
         DownBlock 256→512  (4×4)
-        GAP → Dropout → Linear(512, latent_dim)
+        GAP → Dropout → Linear(512, latent_dim)            [AE]
+        GAP → Dropout → Linear(512, 2*latent_dim)          [VAE: μ, logσ²]
+
+    Always returns ``(z, kl)``:
+      - AE  mode (variational=False): kl is a zero scalar.
+      - VAE mode (variational=True):
+          * training:  z = μ + exp(0.5·logσ²) · ε,   kl = -0.5·Σ(1+logσ² - μ² - σ²)
+          * eval/export: z = μ (deterministic), kl still computed for logging.
     """
 
-    def __init__(self, latent_dim: int = 512, num_groups: int = 8, dropout: float = 0.1):
+    def __init__(self, latent_dim: int = 512, num_groups: int = 8,
+                 dropout: float = 0.1, variational: bool = False):
         super().__init__()
+        self.variational = variational
+        self.latent_dim = latent_dim
+
         self.stem = nn.Sequential(
             nn.Conv2d(3, 64, 3, padding=1, bias=False),
             nn.GroupNorm(min(num_groups, 64), 64),
@@ -159,10 +170,17 @@ class CIFAREncoder(nn.Module):
 
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.dropout = nn.Dropout(p=dropout)
-        self.fc = nn.Linear(512, latent_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, 3, 32, 32) → (B, latent_dim)"""
+        if variational:
+            self.fc_mu = nn.Linear(512, latent_dim)
+            self.fc_logvar = nn.Linear(512, latent_dim)
+            # init logvar head small so initial σ ≈ 1, avoids early-training blowup
+            nn.init.zeros_(self.fc_logvar.weight)
+            nn.init.zeros_(self.fc_logvar.bias)
+        else:
+            self.fc = nn.Linear(512, latent_dim)
+
+    def _backbone(self, x: torch.Tensor) -> torch.Tensor:
         h = self.stem(x)
         h = self.stem_res1(h)
         h = self.stem_res2(h)
@@ -170,8 +188,25 @@ class CIFAREncoder(nn.Module):
         h = self.down2(h)
         h = self.down3(h)
         h = self.pool(h).flatten(1)
-        h = self.dropout(h)
-        return self.fc(h)
+        return self.dropout(h)
+
+    def forward(self, x: torch.Tensor):
+        """x: (B, 3, 32, 32) → (z, kl)"""
+        h = self._backbone(x)
+        if not self.variational:
+            return self.fc(h), torch.zeros((), device=x.device)
+
+        mu = self.fc_mu(h)
+        # clamp logvar for numerical safety (σ ∈ [~6.7e-3, ~22])
+        logvar = self.fc_logvar(h).clamp(-10.0, 6.0)
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            z = mu + std * torch.randn_like(std)
+        else:
+            z = mu
+        # KL( N(μ, σ²) || N(0, I) ), per-sample sum over latent dims, then mean over batch
+        kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).sum(dim=-1).mean()
+        return z, kl
 
 
 # ---------------------------------------------------------------------------

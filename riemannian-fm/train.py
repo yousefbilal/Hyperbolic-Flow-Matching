@@ -19,6 +19,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import LearningRateMonitor
+from pytorch_lightning.plugins.environments import SLURMEnvironment
 
 from manifm.datasets import get_loaders
 from manifm.model_pl import ManifoldFMLitModule
@@ -36,7 +37,9 @@ def main(cfg: DictConfig):
     logging.getLogger("pytorch_lightning").setLevel(logging.getLevelName("INFO"))
 
     if cfg.get("seed", None) is not None:
-        pl.utilities.seed.seed_everything(cfg.seed)
+        # pl.utilities.seed.seed_everything was removed in PL >= 1.7;
+        # the function lives at the top level now.
+        pl.seed_everything(cfg.seed)
 
     print(cfg)
 
@@ -80,7 +83,7 @@ def main(cfg: DictConfig):
         LearningRateMonitor(),
     ]
 
-    slurm_plugin = pl.plugins.environments.SLURMEnvironment(auto_requeue=False)
+    slurm_plugin = SLURMEnvironment(auto_requeue=False)
 
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     cfg_dict["cwd"] = os.getcwd()

@@ -37,6 +37,7 @@ class AblationConfig:
     ssim_lambda: float = 0.1
     reverse_lambda: float = 0.0
     ms_ssim_lambda: float = 0.0
+    kl_lambda: float = 0.0          # > 0 turns HAECifar into a VAE (CIFAR only)
 
     # --- Imbalance handling ------------------------------------------------
     # Sampler: instance (natural) | balanced (1/n_c) | sqrt (1/sqrt(n_c))
