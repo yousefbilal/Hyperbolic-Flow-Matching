@@ -33,7 +33,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image
 
@@ -106,6 +106,10 @@ def parse_args():
     p.add_argument("--workers", type=int, default=4)
 
     # loss weights
+    p.add_argument("--pretrain_epochs", type=int, default=0,
+                   help="Train as a pure AE for this many epochs before "
+                        "the hyperbolic-head loss starts to ramp in. "
+                        "0 = no pretraining stage (default).")
     p.add_argument("--hyperbolic_lambda", type=float, default=0.05,
                    help="Weight of NLL hyperbolic loss (warm-up over first 20 epochs)")
     p.add_argument("--hyper_warmup_epochs", type=int, default=20)
@@ -119,6 +123,12 @@ def parse_args():
                    help="Weight of MS-SSIM perceptual loss (0 = off, needs kernel_size tuning)")
     p.add_argument("--lpips_bb", type=str, default="alex",
                    choices=["alex", "vgg", "squeeze"])
+    p.add_argument("--kl_lambda", type=float, default=0.0,
+                   help="If > 0, train HAECifar as a VAE with KL weight "
+                        "(Stable-Diffusion-style ~1e-6 .. 1e-4 keeps recons "
+                        "sharp while making the latent space samplable). "
+                        "0 = deterministic AE (default). CIFAR only — "
+                        "ignored for ImageNet path.")
 
     # logging / checkpoints
     p.add_argument("--exp_dir", type=str, required=True)
@@ -128,6 +138,10 @@ def parse_args():
                    help="Save reconstruction grid every N steps")
     p.add_argument("--save_interval", type=int, default=5000)
     p.add_argument("--val_interval", type=int, default=1000)
+    p.add_argument("--val_subset_size", type=int, default=5000,
+                   help="Use a class-stratified subset of this size for periodic "
+                        "validation. Set to 0 to use the full test set every time. "
+                        "A full-test pass is always run at the end of training.")
     p.add_argument("--use_wandb", action="store_true")
 
     return p.parse_args()
@@ -218,11 +232,21 @@ def build_class_weights(train_ds, mode: str, beta: float, num_classes: int,
     return torch.as_tensor(w, dtype=torch.float32, device=device)
 
 
-def hyperbolic_weight(epoch: int, warmup_epochs: int, target: float) -> float:
-    """Linear warmup of the hyperbolic loss weight."""
+def hyperbolic_weight(epoch: int, warmup_epochs: int, target: float,
+                      pretrain_epochs: int = 0) -> float:
+    """Schedule for the hyperbolic loss weight.
+
+    Phases:
+      [0, pretrain_epochs)               -> 0   (pure AE pretraining)
+      [pretrain_epochs, +warmup_epochs)  -> linear ramp 0 -> target
+      [pretrain_epochs+warmup_epochs, ∞) -> target
+    """
+    if epoch < pretrain_epochs:
+        return 0.0
+    e = epoch - pretrain_epochs
     if warmup_epochs <= 0:
         return target
-    return min(1.0, epoch / warmup_epochs) * target
+    return min(1.0, e / warmup_epochs) * target
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +282,40 @@ def main():
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=args.workers, drop_last=False, pin_memory=True)
 
+    # ---- Quick-val subset (for periodic in-training validation) -----------
+    # Stratified: at least one sample per class so head/mid/tail metrics
+    # remain meaningful, then top up uniformly to val_subset_size.
+    if args.val_subset_size and args.val_subset_size < len(test_ds):
+        val_targets = (test_ds.targets if hasattr(test_ds, "targets")
+                       else [test_ds[i][1] for i in range(len(test_ds))])
+        val_targets = np.asarray(val_targets)
+        rng = np.random.default_rng(0)
+        per_class = {}
+        for idx, c in enumerate(val_targets):
+            per_class.setdefault(int(c), []).append(idx)
+        # one stratified sample per class
+        stratified = [int(rng.choice(idxs)) for idxs in per_class.values()]
+        chosen = set(stratified)
+        # top up uniformly without replacement
+        remaining = [i for i in range(len(test_ds)) if i not in chosen]
+        n_extra = max(0, args.val_subset_size - len(stratified))
+        if n_extra > 0 and remaining:
+            extra = rng.choice(remaining,
+                               size=min(n_extra, len(remaining)),
+                               replace=False)
+            stratified.extend(int(i) for i in extra)
+        val_subset = Subset(test_ds, sorted(stratified))
+        val_loader_quick = DataLoader(
+            val_subset, batch_size=args.batch_size, shuffle=False,
+            num_workers=max(2, args.workers // 2), drop_last=False,
+            pin_memory=True,
+        )
+        print(f"Quick val: {len(val_subset)} samples "
+              f"({len(per_class)} classes, ≥1 per class)")
+    else:
+        val_loader_quick = test_loader
+        print(f"Quick val: full test set ({len(test_ds)} samples)")
+
     class_weights = build_class_weights(
         train_ds, args.class_weighting, args.eff_num_beta, num_classes, device
     )
@@ -287,13 +345,17 @@ def main():
         ).to(device)
         print("Using HAEImageNet (frozen SD-VAE + hyperbolic head)")
     else:
+        variational = args.kl_lambda > 0.0
         model = HAECifar(
             num_classes=num_classes,
             latent_dim=args.latent_dim,
             feature_size=args.feature_size,
             curvature=args.curvature,
+            variational=variational,
         ).to(device)
-        print("Using HAECifar (trained CNN + hyperbolic head)")
+        mode = "VAE" if variational else "AE"
+        print(f"Using HAECifar [{mode}] (trained CNN + hyperbolic head, "
+              f"kl_λ={args.kl_lambda})")
     print(model)
 
     # ---- Optimiser --------------------------------------------------------
@@ -348,17 +410,22 @@ def main():
         t0 = time.time()
 
         lam_hyper = hyperbolic_weight(epoch, args.hyper_warmup_epochs,
-                                      args.hyperbolic_lambda)
+                                      args.hyperbolic_lambda,
+                                      pretrain_epochs=args.pretrain_epochs)
 
         for batch_idx, (images, labels) in enumerate(train_loader):
             images = images.to(device)
             labels = labels.to(device)
 
-            recon, logits, z_hyp, z_euc, z_euc_dec = model(images)
+            recon, logits, z_hyp, z_euc, z_euc_dec, kl = model(images)
 
             # --- Losses ---
             loss_recon = l1_loss_fn(recon, images)
             loss = loss_recon
+
+            # KL divergence (VAE mode only — kl is a zero scalar otherwise)
+            if args.kl_lambda > 0:
+                loss = loss + args.kl_lambda * kl
 
             # Hyperbolic classification (optionally class-weighted)
             loss_hyper = F.nll_loss(logits, labels, weight=class_weights)
@@ -431,6 +498,7 @@ def main():
                       f"reverse={loss_reverse.item():.4f}  "
                       f"con={loss_con.item():.4f}  "
                       f"rad={loss_radius.item():.4f}  "
+                      f"kl={kl.item():.4f}  "
                       f"acc={100.*correct/total:.1f}% lr={lr_now:.2e}")
                 print(f"  z_euc norm — mean: {z_norms.mean():.3f}  max: {z_norms.max():.3f}")
                 print(f"  z_hyp norm — mean: {z_hyp_norms.mean():.3f}  max: {z_hyp_norms.max():.3f}")
@@ -442,6 +510,7 @@ def main():
                 writer.add_scalar("train/loss_reverse", loss_reverse.item(), global_step)
                 writer.add_scalar("train/loss_contrastive", loss_con.item(), global_step)
                 writer.add_scalar("train/loss_radius", loss_radius.item(), global_step)
+                writer.add_scalar("train/loss_kl", kl.item(), global_step)
                 writer.add_scalar("train/accuracy", 100. * correct / total, global_step)
                 writer.add_scalar("train/lr", lr_now, global_step)
                 writer.add_scalar("train/lam_hyper", lam_hyper, global_step)
@@ -471,9 +540,9 @@ def main():
                 save_image(comparison, os.path.join(img_dir, f"recon_{global_step:06d}.png"),
                            nrow=n, normalize=True, value_range=(-1, 1))
 
-            # --- Validation ---
+            # --- Validation (periodic; uses quick subset when configured) ---
             if global_step % args.val_interval == 0:
-                val_loss = validate(model, test_loader, device, l1_loss_fn,
+                val_loss = validate(model, val_loader_quick, device, l1_loss_fn,
                                     writer, global_step, lam_hyper,
                                     class_weights)
                 if val_loss < best_val_loss:
@@ -503,6 +572,13 @@ def main():
     # final checkpoint
     save_checkpoint(model, optimizer, args, global_step, epoch,
                     ckpt_dir, "final_model.pt")
+
+    # one full-test pass at the end so the headline number is on all 50k
+    if val_loader_quick is not test_loader:
+        print("Running final validation on FULL test set...")
+        validate(model, test_loader, device, l1_loss_fn, writer, global_step,
+                 lam_hyper, class_weights)
+
     writer.close()
     print("Training complete.")
 
@@ -525,11 +601,13 @@ def validate(model, loader, device, l1_loss_fn, writer, global_step,
 
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
-        recon, logits, z_hyp, z_euc, z_euc_dec = model(images)
+        recon, logits, z_hyp, z_euc, z_euc_dec, _kl = model(images)
 
         loss_recon = l1_loss_fn(recon, images)
         # val NLL is unweighted to keep metric comparable across runs
         loss_hyper = F.nll_loss(logits, labels)
+        # NB: KL deliberately excluded from val loss so the "best_model"
+        # selection compares pure recon+nll across AE / VAE runs.
         loss = loss_recon + lam_hyper * loss_hyper
 
         total_loss += loss.item() * images.size(0)

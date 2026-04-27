@@ -656,12 +656,19 @@ class ManifoldFMLitModule(pl.LightningModule):
         else:
             t = torch.rand(N).reshape(-1, 1).to(x1)
 
-            def cond_u(x0, x1, t):
-                path = geodesic(self.manifold, x0, x1)
-                x_t, u_t = jvp(path, (t,), (torch.ones_like(t).to(t),))
-                return x_t, u_t
-            print(x0.shape, x1.shape, t.shape)
-            x_t, u_t = vmap(cond_u)(x0, x1, t)
+            # NB: vmap over geoopt's @torch.jit.script math (logmap/expmap)
+            # fails on recent torch with "Cannot access data pointer of
+            # Tensor that doesn't have storage" — BatchedTensor has no
+            # storage and the scripted code calls .data_ptr() internally.
+            # geoopt's logmap/expmap are already batch-aware, so build the
+            # constant-speed geodesic γ(t) = expmap(x0, t·logmap(x0,x1))
+            # inline and let jvp give us (γ(t), γ'(t)) at the batch level.
+            shooting_tangent_vec = self.manifold.logmap(x0, x1)  # (N, dim)
+
+            def path(t_b):                                       # (N, 1) → (N, dim)
+                return self.manifold.expmap(x0, t_b * shooting_tangent_vec)
+
+            x_t, u_t = jvp(path, (t,), (torch.ones_like(t).to(t),))
             x_t = x_t.reshape(N, self.dim)
             u_t = u_t.reshape(N, self.dim)
 
