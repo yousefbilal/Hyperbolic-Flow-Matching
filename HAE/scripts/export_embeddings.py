@@ -64,9 +64,13 @@ def build_model(args, saved_args, num_classes, device):
     curvature = saved_args.get("curvature", -1.0)
     latent_dim = saved_args.get("latent_dim", 512)
     feature_size = saved_args.get("feature_size", 512)
+    # VAE flag must match how the checkpoint was trained (changes encoder
+    # parameters: fc vs fc_mu/fc_logvar)
+    variational = float(saved_args.get("kl_lambda", 0.0)) > 0.0
     if args.dataset in ("cifar10", "cifar100"):
         model = HAECifar(num_classes=num_classes, latent_dim=latent_dim,
-                         feature_size=feature_size, curvature=curvature)
+                         feature_size=feature_size, curvature=curvature,
+                         variational=variational)
     else:
         model = HAEImageNet(num_classes=num_classes, latent_dim=latent_dim,
                             feature_size=feature_size, curvature=curvature)
@@ -95,7 +99,10 @@ def main():
     with torch.no_grad():
         for images, labels in loader:
             images = images.to(device)
-            _, _, z_hyp, _, _ = model(images)
+            # 6-tuple now: (recon, logits, z_hyp, z_euc, z_euc_dec, kl).
+            # In VAE mode, model.eval() makes the encoder return μ (deterministic),
+            # so exported z_hyp is reproducible across calls.
+            _, _, z_hyp, _, _, _ = model(images)
             all_z_hyp.append(z_hyp.cpu())
             all_labels.append(labels)
 

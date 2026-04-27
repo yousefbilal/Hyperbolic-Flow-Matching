@@ -99,6 +99,7 @@ def run_experiment(cfg: AblationConfig, args):
             "--hyperbolic_lambda", str(cfg.hyperbolic_lambda),
             "--hyper_warmup_epochs", str(cfg.hyper_warmup_epochs),
             "--ms_ssim_lambda", str(cfg.ms_ssim_lambda),
+            "--kl_lambda", str(cfg.kl_lambda),
             "--num_epochs", str(cfg.hae_epochs),
             "--batch_size", str(cfg.hae_batch_size),
             "--lr", str(cfg.hae_lr),

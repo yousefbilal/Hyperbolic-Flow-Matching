@@ -17,11 +17,16 @@ class HAECifar(nn.Module):
 
     Forward::
 
-        x → encoder → z_euc → GeometryHead → (logits, z_hyp, z_euc_dec)
-                                                                │
-                                                            decoder → recon
+        x → encoder → (z_euc, kl) → GeometryHead → (logits, z_hyp, z_euc_dec)
+                                                                  │
+                                                              decoder → recon
 
-    Returns (recon, logits, z_hyp, z_euc, z_euc_dec).
+    Returns (recon, logits, z_hyp, z_euc, z_euc_dec, kl).
+
+    `variational=True` makes the encoder a VAE: z_euc is sampled via reparam
+    during training (mean at eval), and `kl` carries the KL term that the
+    trainer multiplies by --kl_lambda. With variational=False, kl is a zero
+    scalar and the model is a deterministic AE.
     """
 
     def __init__(
@@ -30,9 +35,11 @@ class HAECifar(nn.Module):
         latent_dim: int = 512,
         feature_size: int = 512,
         curvature: float = -1.0,
+        variational: bool = False,
     ):
         super().__init__()
-        self.encoder = CIFAREncoder(latent_dim=latent_dim)
+        self.variational = variational
+        self.encoder = CIFAREncoder(latent_dim=latent_dim, variational=variational)
         self.decoder = CIFARDecoder(latent_dim=feature_size)
         self.head = GeometryHead(
             latent_dim=latent_dim,
@@ -42,17 +49,19 @@ class HAECifar(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        z_euc = self.encoder(x)
+        z_euc, kl = self.encoder(x)
         logits, z_hyp, z_euc_dec = self.head(z_euc)
         recon = self.decoder(z_euc_dec)
-        return recon, logits, z_hyp, z_euc, z_euc_dec
+        return recon, logits, z_hyp, z_euc, z_euc_dec, kl
 
 
 if __name__ == "__main__":
     x = torch.randn((2, 3, 32, 32))
     for k in (-1.0, 0.0):
-        m = HAECifar(curvature=k)
-        recon, logits, z_hyp, z_euc, z_euc_dec = m(x)
-        print(f"k={k}: recon={recon.shape}, logits={logits.shape}, "
-              f"z_hyp={z_hyp.shape}, z_euc_dec={z_euc_dec.shape}, "
-              f"euclidean_head={m.head.euclidean}")
+        for variational in (False, True):
+            m = HAECifar(curvature=k, variational=variational)
+            recon, logits, z_hyp, z_euc, z_euc_dec, kl = m(x)
+            print(f"k={k} variational={variational}: recon={recon.shape}, "
+                  f"logits={logits.shape}, z_hyp={z_hyp.shape}, "
+                  f"z_euc_dec={z_euc_dec.shape}, kl={kl.item():.4f}, "
+                  f"euclidean_head={m.head.euclidean}")

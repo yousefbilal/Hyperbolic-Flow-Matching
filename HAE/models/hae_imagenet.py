@@ -122,7 +122,9 @@ class HAEImageNet(nn.Module):
         z_spatial_dec = z_flat_dec.reshape(B, self.channels, self.spatial, self.spatial)
         recon = self.vae.decode(z_spatial_dec)               # (B, 3, 256, 256)
 
-        return recon, logits, z_hyp, z_euc, z_euc_dec
+        # ImageNet path is currently AE-only; return zero KL for interface parity
+        kl = torch.zeros((), device=x.device)
+        return recon, logits, z_hyp, z_euc, z_euc_dec, kl
 
 
 if __name__ == "__main__":
