@@ -143,14 +143,17 @@ class MobiusLinear(torch.nn.Linear):
                 self.ball = manifold = geoopt.PoincareBall(c=k_t.abs())
                 self.bias = geoopt.ManifoldParameter(self.bias, manifold=manifold)
                 with torch.no_grad():
-                    self.bias.set_(gmath.expmap0(self.bias.normal_() / 4, k=k_t))
+                    self.bias.zero_()
+                    # self.bias.set_(gmath.expmap0(self.bias.normal_() / 4, k=k_t))
                     #self.bias.set_(gmath.expmap0(self.bias.normal_() / 400, k=k))
         with torch.no_grad():
             # 1e-2 was the original value in the code. The updated one is from HNN++
             #std = 1 / np.sqrt(2 * self.weight.shape[0] * self.weight.shape[1])
-            std = 1e-2
+            # std = 1e-2
             # Actually, we divide that by 100 so that it starts really small and far from the border
             #std = std / 100
+            in_dim, out_dim = self.weight.shape[1], self.weight.shape[0]
+            std = (2.0 * in_dim * out_dim) ** -0.5
             self.weight.normal_(std=std)
         self.hyperbolic_bias = hyperbolic_bias
         self.hyperbolic_input = hyperbolic_input
