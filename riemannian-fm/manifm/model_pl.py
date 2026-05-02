@@ -55,6 +55,26 @@ def output_and_div(vecfield, x, v=None, div_mode="exact"):
 
 
 class ManifoldFMLitModule(pl.LightningModule):
+    @staticmethod
+    def _build_class_weights(counts, mode: str, beta: float = 0.9999):
+        """Per-class loss weight tensor (len = C) or None.
+
+        counts: list[int] | None — training-set per-class counts.
+        mode:   none | inv_freq | effective_number
+        beta:   used only for effective_number; standard CB-loss schedule.
+        """
+        if counts is None or mode in (None, "none"):
+            return None
+        c = torch.as_tensor(list(counts), dtype=torch.float).clamp_min(1.0)
+        if mode == "inv_freq":
+            w = 1.0 / c
+        elif mode == "effective_number":
+            eff = (1.0 - (beta ** c)) / max(1.0 - beta, 1e-12)
+            w = 1.0 / eff
+        else:
+            raise ValueError(f"Unknown rfm_class_weighting mode: {mode}")
+        return (w / w.mean()).to(torch.float32)
+
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
@@ -66,6 +86,23 @@ class ManifoldFMLitModule(pl.LightningModule):
         self.num_classes = int(cfg.get("num_classes", 0))
         self.cfg_label_dropout = float(cfg.get("cfg_label_dropout", 0.1))
         self.cfg_cond_dim = int(cfg.get("cfg_cond_dim", 64))
+
+        # Long-tail loss weighting (orthogonal to the data sampler):
+        #   none              — every sample weighted equally (default)
+        #   inv_freq          — w_c ∝ 1/n_c
+        #   effective_number  — Cui et al. 2019, w_c ∝ (1−β)/(1−β^n_c)
+        # Counts come from cfg.rfm_class_counts (a list[int]) which the
+        # train.py entrypoint should populate from the labels file.
+        self.rfm_class_weighting = str(cfg.get("rfm_class_weighting", "none"))
+        rfm_class_weights = self._build_class_weights(
+            counts=cfg.get("rfm_class_counts", None),
+            mode=self.rfm_class_weighting,
+            beta=float(cfg.get("rfm_eff_num_beta", 0.9999)),
+        )
+        if rfm_class_weights is not None:
+            self.register_buffer("rfm_class_weights", rfm_class_weights)
+        else:
+            self.rfm_class_weights = None
 
         if self.fm_conditioning == "cfg":
             assert self.num_classes > 0, "cfg requires num_classes > 0"
@@ -689,19 +726,21 @@ class ManifoldFMLitModule(pl.LightningModule):
             # x_t = torch.cat(x_t_list, dim=0)  # [N, dim]
             # u_t = torch.cat(u_t_list, dim=0)
 
+        # Track the *original* labels (before CFG drop) for class weighting.
+        orig_labels = None
+        if isinstance(batch, dict) and "label" in batch:
+            orig_labels = batch["label"].to(x1.device).long()
+
         if self.fm_conditioning == "cfg":
-            labels = None
-            if isinstance(batch, dict) and "label" in batch:
-                labels = batch["label"].to(x1.device).long()
-            if labels is None:
+            if orig_labels is None:
                 labels = torch.full((N,), self.num_classes,
                                     dtype=torch.long, device=x1.device)
             else:
                 # -1 → null token
                 labels = torch.where(
-                    labels < 0,
-                    torch.full_like(labels, self.num_classes),
-                    labels,
+                    orig_labels < 0,
+                    torch.full_like(orig_labels, self.num_classes),
+                    orig_labels,
                 )
                 if self.training and self.cfg_label_dropout > 0:
                     drop = torch.rand(labels.shape, device=labels.device) < self.cfg_label_dropout
@@ -715,7 +754,22 @@ class ManifoldFMLitModule(pl.LightningModule):
             diff = self.vecfield(t, x_t, labels) - u_t
         else:
             diff = self.vecfield(t, x_t) - u_t
-        return self.manifold.inner(x_t, diff, diff).mean() / self.dim
+
+        # ---- Per-sample reduction --------------------------------------
+        # inner gives a scalar per (sample, t-replica). Reduce per-sample
+        # so we can apply optional class weights.
+        per_sample = self.manifold.inner(x_t, diff, diff)             # (N_eff,)
+        if (self.rfm_class_weights is not None) and (orig_labels is not None):
+            # Match the (possibly repeated) batch dim from Mesh paths.
+            cls = orig_labels.clamp_min(0)
+            if cls.shape[0] != per_sample.shape[0]:
+                cls = cls.repeat_interleave(per_sample.shape[0] // cls.shape[0])
+            valid = (orig_labels >= 0).float()
+            if valid.shape[0] != per_sample.shape[0]:
+                valid = valid.repeat_interleave(per_sample.shape[0] // valid.shape[0])
+            w = self.rfm_class_weights.to(per_sample)[cls] * valid
+            return (per_sample * w).sum() / w.sum().clamp_min(1.0) / self.dim
+        return per_sample.mean() / self.dim
 
     def training_step(self, batch: Any, batch_idx: int):
         loss = self.loss_fn(batch)

@@ -19,6 +19,14 @@ images_labels: /home/fvaleau/HAE/proj/umap_flowers/labels
 images_datadir_A: /home/fvaleau/HAE/proj/selected_embeddings/100
 images_datadir_B: /home/fvaleau/HAE/proj/selected_embeddings/102
 
+# Long-tail handling for the RFM trainer (CIFAR-LT, ImageNet-LT). Both knobs
+# are independent of the HAE side and act on the embedding-level training of
+# the vector field.
+rfm_sampler: instance        # {instance, balanced, sqrt}
+rfm_class_weighting: none    # {none, inv_freq, effective_number}
+rfm_eff_num_beta: 0.9999     # only used when rfm_class_weighting=effective_number
+rfm_class_counts: null       # populated automatically by train.py from the labels file
+
 # Only used for sampling from wrapped distributions.
 wrapped:
   dim: 5

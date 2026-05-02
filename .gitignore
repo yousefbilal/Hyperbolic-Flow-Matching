@@ -14,6 +14,9 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 
+# experiment outputs (checkpoints, embeddings, samples, sweep configs)
+experiments/
+
 # data & outputs
 Sidechain-auto-encoder/
 HAE/FID/flowers_test/

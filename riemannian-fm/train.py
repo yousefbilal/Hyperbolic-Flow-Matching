@@ -64,6 +64,31 @@ def main(cfg: DictConfig):
     # Load dataset
     train_loader, val_loader, test_loader = get_loaders(cfg)
 
+    # Compute per-class counts on the training subset and attach to cfg, so
+    # ManifoldFMLitModule can build its rfm_class_weights buffer. We do this
+    # here (not inside get_loaders) so the path stays Hydra-friendly.
+    if str(cfg.get("rfm_class_weighting", "none")) != "none":
+        from omegaconf import OmegaConf
+        OmegaConf.set_struct(cfg, False)
+        try:
+            base_dataset = train_loader.dataset
+            inner = base_dataset
+            while hasattr(inner, "dset"):           # ExpandDataset
+                inner = inner.dset
+            indices = getattr(inner, "indices", None)
+            full = getattr(inner, "dataset", inner) # Subset.dataset
+            if hasattr(full, "labels") and full.labels is not None:
+                if indices is not None:
+                    sub_labels = full.labels[indices].long()
+                else:
+                    sub_labels = full.labels.long()
+                counts = torch.bincount(sub_labels).tolist()
+                cfg.rfm_class_counts = counts
+                log.info(f"rfm_class_weighting={cfg.rfm_class_weighting} | "
+                         f"per-class counts: {counts}")
+        finally:
+            OmegaConf.set_struct(cfg, True)
+
     # Construct model
     model = ManifoldFMLitModule(cfg)
     print(model)
