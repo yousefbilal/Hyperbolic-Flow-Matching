@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import igl
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 from manifm.manifolds import Sphere, FlatTorus, Mesh, SPD, PoincareBall, Euclidean
 from manifm.manifolds.mesh import Metric
@@ -276,8 +276,8 @@ class HyperbolicImages(Dataset):
 
     def __len__(self):
         return len(self.emb)
-    
-    
+
+
     def __getitem__(self, idx, dim=512):
 
         x1 = self.emb[idx].reshape(-1)
@@ -298,6 +298,15 @@ class HyperbolicImages(Dataset):
             j = torch.randint(0, len(self.emb), (1,)).item()
             x0 = self.emb[j]
             return {"x0": x0, "x1": x1, "label": label}
+
+    # ---- imbalance helpers (shared with EuclideanImages) -----------------
+
+    def get_class_counts(self):
+        """Return torch.Tensor of shape (C,) with per-class sample counts,
+        or None if no labels are available."""
+        if self.labels is None:
+            return None
+        return torch.bincount(self.labels.long())
 
 
 class EuclideanImages(Dataset):
@@ -340,7 +349,14 @@ class EuclideanImages(Dataset):
         x0 = self.manifold.random_normal(self.dim, mean=torch.zeros(self.dim), std=1.0)
         label = int(self.labels[idx].item()) if self.labels is not None else -1
         return {"x0": x0, "x1": x1, "label": label}
-            
+
+    def get_class_counts(self):
+        """Return torch.Tensor of shape (C,) with per-class sample counts,
+        or None if no labels are available."""
+        if self.labels is None:
+            return None
+        return torch.bincount(self.labels.long())
+
 '''
 class HyperbolicImages(Dataset):
     """
@@ -694,8 +710,18 @@ def get_loaders(cfg):
     # Expand the training set (we optimize based on number of iterations anyway).
     train_set = ExpandDataset(train_set, expand_factor=expand_factor)
 
+    # ---- Optional class-balanced sampler -----------------------------------
+    # Long-tail RFM training: oversample tail classes so the FM (and the CFG
+    # null token) see a balanced exposure across classes. Modes:
+    #   instance | balanced | sqrt
+    sampler_mode = cfg.get("rfm_sampler", "instance")
+    sampler = _build_class_sampler(dataset, train_set, sampler_mode)
+    shuffle = sampler is None
+
     train_loader = DataLoader(
-        train_set, cfg.optim.batch_size, shuffle=True, pin_memory=True, drop_last=True
+        train_set, cfg.optim.batch_size,
+        sampler=sampler, shuffle=shuffle,
+        pin_memory=True, drop_last=True,
     )
     val_loader = DataLoader(
         val_set, cfg.optim.val_batch_size, shuffle=False, pin_memory=True
@@ -705,6 +731,45 @@ def get_loaders(cfg):
     )
 
     return train_loader, val_loader, test_loader
+
+
+def _build_class_sampler(base_dataset, train_set, mode: str):
+    """Return a WeightedRandomSampler for the (expanded) train set, or None.
+
+    train_set is `ExpandDataset(Subset(base_dataset, train_indices), expand_factor)`.
+    We resolve labels by walking back to base_dataset and using the Subset's
+    indices, then tile by expand_factor so weights line up with len(train_set).
+    """
+    if mode in (None, "instance", "none"):
+        return None
+    if mode not in ("balanced", "sqrt"):
+        raise ValueError(f"Unknown rfm_sampler mode: {mode}")
+
+    # Unwrap ExpandDataset → Subset → underlying dataset
+    inner = train_set
+    expand = 1
+    if isinstance(inner, ExpandDataset):
+        expand = inner.expand_factor
+        inner = inner.dset
+    if not hasattr(inner, "indices"):
+        # Not a Subset; can't build per-sample weights without indices.
+        return None
+    train_indices = torch.as_tensor(inner.indices, dtype=torch.long)
+
+    if not hasattr(base_dataset, "labels") or base_dataset.labels is None:
+        return None
+    train_labels = base_dataset.labels[train_indices].long()
+    counts = torch.bincount(train_labels).float().clamp_min(1.0)
+    if mode == "balanced":
+        cls_w = 1.0 / counts
+    else:  # sqrt
+        cls_w = 1.0 / counts.sqrt()
+    cls_w = cls_w / cls_w.mean()                  # normalise so mean weight = 1
+    base_w = cls_w[train_labels]                  # (N_train,)
+    sample_w = base_w.repeat(expand)              # (N_train * expand_factor,)
+    return WeightedRandomSampler(
+        weights=sample_w, num_samples=len(sample_w), replacement=True,
+    )
 
 
 def get_manifold(cfg):
