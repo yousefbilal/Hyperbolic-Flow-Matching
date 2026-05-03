@@ -137,7 +137,13 @@ def parse_args():
     p.add_argument("--ssim_lambda", type=float, default=0.1,
                    help="Weight of SSIM loss (0 = off)")
     p.add_argument("--reverse_lambda", type=float, default=0.0,
-                   help="Weight of reverse/cycle-consistency loss MSE(z_euc, z_euc_dec) (0 = off)")
+                   help="Weight of the W+-cycle reconstruction loss (paper's "
+                        "L_rec, coach.py:247): MSE between the pre-proj_enc "
+                        "frozen-VAE features and the post-proj_dec reconstruction "
+                        "(spans both MLPs + the manifold round-trip). For HAEImageNet "
+                        "/ HAETinyImg paths only. HAECifar (cnn_cifar) has no "
+                        "analogous bottleneck, so the loss falls back to the inner "
+                        "MSE(z_euc, z_euc_dec) — weak but kept for back-compat. 0 = off.")
     p.add_argument("--ms_ssim_lambda", type=float, default=0.0,
                    help="Weight of MS-SSIM perceptual loss (0 = off, needs kernel_size tuning)")
     p.add_argument("--lpips_bb", type=str, default="alex",
@@ -528,9 +534,19 @@ def main():
                 loss = loss + args.ms_ssim_lambda * loss_ms_ssim
 
             # Reverse / cycle-consistency loss: MSE(z_euc, z_euc_dec)
+            # Paper's L_rec (coach.py:247): MSE(w, w') across both proj MLPs.
+            # On HAEImageNet/TAESD paths the analogue is MSE(z_flat, z_flat_dec)
+            # — the model stashes these on `_z_flat_target` / `_z_flat_recon`.
+            # On HAECifar there's no pre-MLP bottleneck (encoder is end-to-end),
+            # so we fall back to the inner manifold cycle MSE(z_euc, z_euc_dec).
             loss_reverse = torch.tensor(0.0, device=device)
             if args.reverse_lambda > 0:
-                loss_reverse = F.mse_loss(z_euc, z_euc_dec)
+                z_flat_t = getattr(model, "_z_flat_target", None)
+                z_flat_r = getattr(model, "_z_flat_recon", None)
+                if z_flat_t is not None and z_flat_r is not None:
+                    loss_reverse = F.mse_loss(z_flat_r, z_flat_t)
+                else:
+                    loss_reverse = F.mse_loss(z_euc, z_euc_dec)
                 loss = loss + args.reverse_lambda * loss_reverse
 
             # Hyperbolic contrastive (+ optional radius prior)
