@@ -68,7 +68,6 @@ def main(cfg: DictConfig):
     # ManifoldFMLitModule can build its rfm_class_weights buffer. We do this
     # here (not inside get_loaders) so the path stays Hydra-friendly.
     if str(cfg.get("rfm_class_weighting", "none")) != "none":
-        from omegaconf import OmegaConf
         OmegaConf.set_struct(cfg, False)
         try:
             base_dataset = train_loader.dataset
