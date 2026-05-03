@@ -154,6 +154,7 @@ def parse_args():
                         "validation. Set to 0 to use the full test set every time. "
                         "A full-test pass is always run at the end of training.")
     p.add_argument("--use_wandb", action="store_true")
+    p.add_argument("--use_l1", action="store_true")
 
     return p.parse_args()
 
@@ -418,7 +419,7 @@ def main():
     )
 
     # ---- Losses -----------------------------------------------------------
-    l1_loss_fn = nn.L1Loss()
+    l1_loss_fn = nn.L1Loss() if args.use_l1 else nn.MSELoss()
 
     lpips_fn = None
     if args.lpips_lambda > 0:
