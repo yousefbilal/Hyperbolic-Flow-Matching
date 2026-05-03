@@ -11,3 +11,10 @@ torchdiffeq
 scikit-learn
 diffusers
 accelerate
+hydra-core>=1.3.2
+hydra-colorlog
+hydra-submitit-launcher
+pytorch_lightning==1.8.5
+pandas
+geopandas
+pyevtk
