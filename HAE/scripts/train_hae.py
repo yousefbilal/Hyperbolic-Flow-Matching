@@ -46,6 +46,10 @@ from models.hae_imagenet import HAEImageNet
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from datasets.cifar_lt import CIFAR10LT, CIFAR100LT, make_cifar_lt_transform
 from datasets.imagenet_lt import ImageNetLT, make_imagenet_lt_transform
+from datasets.tiny_imagenet_lt import (
+    TinyImageNetLT, make_tiny_imagenet_lt_transform,
+    NATIVE_RESOLUTION as TINY_IMAGENET_RESOLUTION,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +61,8 @@ def parse_args():
 
     # dataset
     p.add_argument("--dataset", type=str, default="cifar10",
-                   choices=["cifar10", "cifar100", "imagenet_lt"])
+                   choices=["cifar10", "cifar100", "imagenet_lt",
+                            "tiny_imagenet_lt"])
     p.add_argument("--imbalance_factor", type=float, default=0.01,
                    help="Exponential imbalance factor (CIFAR only; ImageNet-LT "
                         "is already imbalanced on disk)")
@@ -70,6 +75,12 @@ def parse_args():
     p.add_argument("--feature_size", type=int, default=512)
     p.add_argument("--curvature", type=float, default=-1.0,
                    help="Negative curvature k for the Poincaré ball")
+    p.add_argument("--encoder_backbone", type=str, default=None,
+                   choices=["cnn_cifar", "sd_vae", "taesd"],
+                   help="Image encoder backbone. If unset, picks a sensible "
+                        "default per dataset: cnn_cifar for CIFAR-10/100, "
+                        "taesd for tiny_imagenet_lt (cheap pretrained), "
+                        "sd_vae for imagenet_lt (full SD-VAE).")
 
     # imbalance handling
     p.add_argument("--sampler", type=str, default="instance",
@@ -173,6 +184,22 @@ def get_datasets(args):
                               transform=train_tf, image_size=image_size)
         test_ds = ImageNetLT(root=args.data_root, train=False,
                              transform=test_tf, image_size=image_size)
+        return train_ds, test_ds, train_ds.num_classes, image_size
+
+    if args.dataset == "tiny_imagenet_lt":
+        # Native res is 64; allow override via --image_size for ablations
+        # that want to share the 32×32 CIFAR backbone.
+        image_size = args.image_size or TINY_IMAGENET_RESOLUTION
+        train_tf = make_tiny_imagenet_lt_transform(image_size=image_size, train=True)
+        test_tf = make_tiny_imagenet_lt_transform(image_size=image_size, train=False)
+        train_ds = TinyImageNetLT(root=args.data_root,
+                                  imbalance_factor=args.imbalance_factor,
+                                  train=True, transform=train_tf,
+                                  image_size=image_size)
+        test_ds = TinyImageNetLT(root=args.data_root,
+                                 imbalance_factor=1.0,    # val stays balanced
+                                 train=False, transform=test_tf,
+                                 image_size=image_size)
         return train_ds, test_ds, train_ds.num_classes, image_size
 
     raise ValueError(f"unknown dataset: {args.dataset}")
@@ -336,15 +363,36 @@ def main():
           f"radius_λ={args.radius_prior_lambda})")
 
     # ---- Model ------------------------------------------------------------
-    if args.dataset == "imagenet_lt":
-        model = HAEImageNet(
+    # Resolve encoder backbone — explicit flag wins, else dataset default.
+    bb = args.encoder_backbone
+    if bb is None:
+        bb = {
+            "cifar10": "cnn_cifar",
+            "cifar100": "cnn_cifar",
+            "tiny_imagenet_lt": "taesd",       # pretrained, cheap
+            "imagenet_lt": "sd_vae",
+        }[args.dataset]
+    args.encoder_backbone = bb   # so it lands in the saved checkpoint args
+
+    if bb in ("sd_vae", "taesd"):
+        from models.hae_imagenet import (
+            HAEImageNet as _HAEImageNet, SD_VAE_NAME, TAESD_NAME,
+        )
+        is_tiny = bb == "taesd"
+        vae_name = TAESD_NAME if is_tiny else SD_VAE_NAME
+        model = _HAEImageNet(
             num_classes=num_classes,
             latent_dim=args.latent_dim,
             feature_size=args.feature_size,
             curvature=args.curvature,
+            vae_name=vae_name,
+            tiny_vae=is_tiny,
+            image_size=image_size,
         ).to(device)
-        print("Using HAEImageNet (frozen SD-VAE + hyperbolic head)")
-    else:
+        print(f"Using HAEImageNet [{bb.upper()}] @ {image_size}× "
+              f"(frozen pretrained AE + hyperbolic head, "
+              f"latent_grid={image_size // 8}×{image_size // 8}×4)")
+    elif bb == "cnn_cifar":
         variational = args.kl_lambda > 0.0
         model = HAECifar(
             num_classes=num_classes,
@@ -352,10 +400,13 @@ def main():
             feature_size=args.feature_size,
             curvature=args.curvature,
             variational=variational,
+            image_size=image_size,
         ).to(device)
         mode = "VAE" if variational else "AE"
-        print(f"Using HAECifar [{mode}] (trained CNN + hyperbolic head, "
-              f"kl_λ={args.kl_lambda})")
+        print(f"Using HAECifar [{mode}] @ {image_size}× (trained CNN + "
+              f"hyperbolic head, kl_λ={args.kl_lambda})")
+    else:
+        raise ValueError(f"Unknown encoder_backbone: {bb}")
     print(model)
 
     # ---- Optimiser --------------------------------------------------------

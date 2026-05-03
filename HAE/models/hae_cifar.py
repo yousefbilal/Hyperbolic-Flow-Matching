@@ -36,11 +36,15 @@ class HAECifar(nn.Module):
         feature_size: int = 512,
         curvature: float = -1.0,
         variational: bool = False,
+        image_size: int = 32,
     ):
         super().__init__()
         self.variational = variational
-        self.encoder = CIFAREncoder(latent_dim=latent_dim, variational=variational)
-        self.decoder = CIFARDecoder(latent_dim=feature_size)
+        self.image_size = int(image_size)
+        self.encoder = CIFAREncoder(latent_dim=latent_dim, variational=variational,
+                                    image_size=self.image_size)
+        self.decoder = CIFARDecoder(latent_dim=feature_size,
+                                    image_size=self.image_size)
         self.head = GeometryHead(
             latent_dim=latent_dim,
             feature_size=feature_size,
