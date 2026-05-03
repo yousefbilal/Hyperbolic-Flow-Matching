@@ -91,6 +91,25 @@ class FrozenSDVae(nn.Module):
         return self.vae.decode(latent / SD_VAE_SCALING).sample
 
 
+def _build_mlp(in_dim: int, hidden_dims, out_dim: int) -> nn.Module:
+    """Linear → LeakyReLU stack ending with Linear(out_dim).
+
+    If `hidden_dims` is empty (or falsy), returns a plain Linear so the
+    saved state_dict keys match the legacy single-Linear setup — old
+    checkpoints (no proj_hidden_dims arg) load without remapping.
+    """
+    if not hidden_dims:
+        return nn.Linear(in_dim, out_dim)
+    layers: list = []
+    prev = in_dim
+    for h in hidden_dims:
+        layers.append(nn.Linear(prev, h))
+        layers.append(nn.LeakyReLU(0.2, inplace=False))
+        prev = h
+    layers.append(nn.Linear(prev, out_dim))
+    return nn.Sequential(*layers)
+
+
 class HAEImageNet(nn.Module):
     """HAE with a frozen pretrained image AE (SD-VAE or TAESD).
 
@@ -98,6 +117,15 @@ class HAEImageNet(nn.Module):
     channels, so for `image_size=S` the latent grid is `(4, S/8, S/8)` and
     flattens to `4·(S/8)²` features. Default S=256 (the SD-VAE training
     resolution); set S=64 for Tiny ImageNet etc.
+
+    `proj_hidden_dims` controls the size of the MLP between flat VAE
+    features and the latent space (and its mirror on the decoder side):
+      []                  →  flat ──Linear──▶ latent          (default; legacy)
+      [1024]              →  flat ─Linear─ReLU─Linear─▶ latent
+      [1024, 512, 256]    →  3-layer MLP, similar to the original pSp
+                              `EqualLinear_encoder_*` projections.
+    The decoder mirror reverses the hidden list, so the architecture is
+    symmetric:  feature_size ─Linear─ReLU─…─▶ flat.
     """
 
     def __init__(
@@ -110,6 +138,7 @@ class HAEImageNet(nn.Module):
         tiny_vae: bool = False,
         image_size: int = 256,
         channels: int = SD_VAE_LATENT_CHANNELS,
+        proj_hidden_dims=(),
     ):
         super().__init__()
         if image_size % SD_VAE_DOWNSAMPLE != 0:
@@ -121,13 +150,16 @@ class HAEImageNet(nn.Module):
         self.spatial = self.image_size // SD_VAE_DOWNSAMPLE
         self.channels = channels
         self.flat_dim = channels * self.spatial * self.spatial
+        self.proj_hidden_dims = tuple(proj_hidden_dims) if proj_hidden_dims else ()
 
         # Frozen pretrained AE
         self.vae = FrozenSDVae(vae_name, tiny=tiny_vae)
 
-        # Learned projections between VAE latent and Euclidean feature
-        self.proj_enc = nn.Linear(self.flat_dim, latent_dim)
-        self.proj_dec = nn.Linear(feature_size, self.flat_dim)
+        # Learned projections between VAE latent and Euclidean feature.
+        # Empty hidden_dims → plain nn.Linear (legacy behaviour, old ckpts).
+        self.proj_enc = _build_mlp(self.flat_dim, self.proj_hidden_dims, latent_dim)
+        self.proj_dec = _build_mlp(feature_size, tuple(reversed(self.proj_hidden_dims)),
+                                   self.flat_dim)
 
         # Shared geometry head (hyperbolic or Euclidean depending on curvature)
         self.head = GeometryHead(
