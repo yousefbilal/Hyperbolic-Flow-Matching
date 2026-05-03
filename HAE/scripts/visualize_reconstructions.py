@@ -33,8 +33,8 @@ from models.hae_cifar import HAECifar
 from models.hae_imagenet import HAEImageNet
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from datasets.cifar_lt import CIFAR10LT, CIFAR100LT, make_cifar_lt_transform
-from datasets.imagenet_lt import ImageNetLT, make_imagenet_lt_transform
+from lt_datasets.cifar_lt import CIFAR10LT, CIFAR100LT, make_cifar_lt_transform
+from lt_datasets.imagenet_lt import ImageNetLT, make_imagenet_lt_transform
 
 
 def parse_args():

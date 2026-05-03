@@ -44,9 +44,9 @@ from models.hae_imagenet import HAEImageNet
 
 # datasets live one level above HAE/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from datasets.cifar_lt import CIFAR10LT, CIFAR100LT, make_cifar_lt_transform
-from datasets.imagenet_lt import ImageNetLT, make_imagenet_lt_transform
-from datasets.tiny_imagenet_lt import (
+from lt_datasets.cifar_lt import CIFAR10LT, CIFAR100LT, make_cifar_lt_transform
+from lt_datasets.imagenet_lt import ImageNetLT, make_imagenet_lt_transform
+from lt_datasets.tiny_imagenet_lt import (
     TinyImageNetLT, make_tiny_imagenet_lt_transform,
     NATIVE_RESOLUTION as TINY_IMAGENET_RESOLUTION,
 )
