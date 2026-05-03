@@ -544,11 +544,11 @@ def main():
 
             # --- Validation (periodic; uses quick subset when configured) ---
             if global_step % args.val_interval == 0:
-                val_loss = validate(model, val_loader_quick, device, l1_loss_fn,
+                val_loss, val_recon = validate(model, val_loader_quick, device, l1_loss_fn,
                                     writer, global_step, lam_hyper,
                                     class_weights)
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                if val_recon < best_val_loss:
+                    best_val_loss = val_recon
                     save_checkpoint(model, optimizer, args, global_step, epoch,
                                     ckpt_dir, "best_model.pt")
                 model.train()
@@ -594,6 +594,7 @@ def validate(model, loader, device, l1_loss_fn, writer, global_step,
              lam_hyper, class_weights):
     model.eval()
     total_loss = 0.0
+    total_recon = 0.0
     correct = 0
     total = 0
 
@@ -613,6 +614,7 @@ def validate(model, loader, device, l1_loss_fn, writer, global_step,
         loss = loss_recon + lam_hyper * loss_hyper
 
         total_loss += loss.item() * images.size(0)
+        total_recon += loss_recon.item() * images.size(0)
         pred = logits.argmax(dim=1)
         correct += pred.eq(labels).sum().item()
         total += labels.size(0)
@@ -628,9 +630,11 @@ def validate(model, loader, device, l1_loss_fn, writer, global_step,
             per_class_total[c] += m.sum()
 
     avg_loss = total_loss / total
+    avg_recon = total_recon / total
     acc = 100.0 * correct / total
-    print(f"  [VAL step {global_step}]  loss={avg_loss:.4f}  acc={acc:.1f}%")
+    print(f"  [VAL step {global_step}]  loss={avg_loss:.4f}  recon_loss={avg_recon:.4f}  acc={acc:.1f}%")
     writer.add_scalar("val/loss", avg_loss, global_step)
+    writer.add_scalar("val/loss_recon", avg_recon, global_step)
     writer.add_scalar("val/accuracy", acc, global_step)
 
     # per-class accuracy (log mean of bottom 1/3 as tail acc)
@@ -648,7 +652,7 @@ def validate(model, loader, device, l1_loss_fn, writer, global_step,
         writer.add_scalar("val/acc_mid", mid_acc, global_step)
         writer.add_scalar("val/acc_tail", tail_acc, global_step)
 
-    return avg_loss
+    return avg_loss, avg_recon
 
 
 # ---------------------------------------------------------------------------
