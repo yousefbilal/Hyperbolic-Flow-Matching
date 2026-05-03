@@ -18,3 +18,4 @@ pytorch_lightning==1.8.5
 pandas
 geopandas
 pyevtk
+datasets
