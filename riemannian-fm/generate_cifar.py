@@ -54,27 +54,39 @@ def load_hae(checkpoint_path, device):
 
     sd = ckpt["state_dict"]
 
-    if dataset in ("cifar10", "cifar100"):
-        from models.hae_cifar import HAECifar
-        num_classes = 10 if dataset == "cifar10" else 100
-        # Match VAE/AE config from training (different encoder weight names)
-        variational = float(saved_args.get("kl_lambda", 0.0)) > 0.0
-        model = HAECifar(num_classes=num_classes, latent_dim=latent_dim,
-                         feature_size=feature_size, curvature=curvature,
-                         variational=variational)
-    elif dataset == "imagenet_lt":
-        from models.hae_imagenet import HAEImageNet
-        # Infer num_classes from checkpoint. Euclidean head → classifier.weight;
-        # hyperbolic head → mlr.a_vals.
-        num_classes = 1000
+    # Per-dataset class counts.
+    num_classes = {"cifar10": 10, "cifar100": 100,
+                   "tiny_imagenet_lt": 200, "imagenet_lt": 1000}.get(dataset)
+    if num_classes is None:
+        raise ValueError(f"Unknown HAE dataset: {dataset}")
+    # Override from checkpoint state for imagenet_lt (legacy, num_classes wasn't
+    # stored explicitly there).
+    if dataset == "imagenet_lt":
         if "head.classifier.weight" in sd:
             num_classes = sd["head.classifier.weight"].shape[0]
         elif "head.mlr.a_vals" in sd:
             num_classes = sd["head.mlr.a_vals"].shape[0]
+
+    image_size = int(saved_args.get("image_size", 32 if dataset.startswith("cifar") else 256))
+    variational = float(saved_args.get("kl_lambda", 0.0)) > 0.0
+
+    # Resolve encoder backbone from saved args; legacy default per dataset.
+    bb = saved_args.get("encoder_backbone")
+    if bb is None:
+        bb = "sd_vae" if dataset == "imagenet_lt" else "cnn_cifar"
+
+    if bb in ("sd_vae", "taesd"):
+        from models.hae_imagenet import HAEImageNet, SD_VAE_NAME, TAESD_NAME
+        is_tiny = bb == "taesd"
         model = HAEImageNet(num_classes=num_classes, latent_dim=latent_dim,
-                            feature_size=feature_size, curvature=curvature)
-    else:
-        raise ValueError(f"Unknown HAE dataset: {dataset}")
+                            feature_size=feature_size, curvature=curvature,
+                            vae_name=TAESD_NAME if is_tiny else SD_VAE_NAME,
+                            tiny_vae=is_tiny, image_size=image_size)
+    else:    # cnn_cifar
+        from models.hae_cifar import HAECifar
+        model = HAECifar(num_classes=num_classes, latent_dim=latent_dim,
+                         feature_size=feature_size, curvature=curvature,
+                         variational=variational, image_size=image_size)
 
     model.load_state_dict(sd)
     model = model.to(device).eval()
@@ -82,10 +94,16 @@ def load_hae(checkpoint_path, device):
 
 
 def decode(model, dataset, z_euc_dec):
-    """Map Euclidean feature back to image space (32x32 for CIFAR, 256x256 for ImageNet)."""
-    if dataset in ("cifar10", "cifar100"):
+    """Map Euclidean feature back to image space.
+
+    Dispatches on whether the model is the from-scratch CNN (HAECifar with
+    a `.decoder`) or the frozen-VAE branch (HAEImageNet with `.proj_dec` +
+    `.vae.decode`). This is independent of `dataset` — the same dataset
+    can use either backbone via --encoder_backbone at training time.
+    """
+    if hasattr(model, "decoder"):                # HAECifar (cnn_cifar)
         return model.decoder(z_euc_dec)
-    # imagenet_lt
+    # HAEImageNet (sd_vae or taesd)
     B = z_euc_dec.shape[0]
     z_flat = model.proj_dec(z_euc_dec)
     z_spatial = z_flat.reshape(B, model.channels, model.spatial, model.spatial)
