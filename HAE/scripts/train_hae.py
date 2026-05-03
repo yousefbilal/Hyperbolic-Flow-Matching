@@ -101,7 +101,7 @@ def parse_args():
                    help="Stop after this many optimiser steps (overrides epochs)")
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--workers", type=int, default=4)
 
@@ -367,7 +367,7 @@ def main():
     )
 
     # ---- Losses -----------------------------------------------------------
-    l1_loss_fn = nn.MSELoss()
+    l1_loss_fn = nn.L1Loss()
 
     lpips_fn = None
     if args.lpips_lambda > 0:
@@ -495,6 +495,7 @@ def main():
                       f"hyper={loss_hyper.item():.4f}  "
                       f"lpips={loss_lpips.item():.4f}  "
                       f"ssim={loss_ssim.item():.4f}  "
+                      f"ms_ssim={loss_ms_ssim.item():.4f}  "
                       f"reverse={loss_reverse.item():.4f}  "
                       f"con={loss_con.item():.4f}  "
                       f"rad={loss_radius.item():.4f}  "
@@ -507,6 +508,7 @@ def main():
                 writer.add_scalar("train/loss_hyper", loss_hyper.item(), global_step)
                 writer.add_scalar("train/loss_lpips", loss_lpips.item(), global_step)
                 writer.add_scalar("train/loss_ssim", loss_ssim.item(), global_step)
+                writer.add_scalar("train/loss_ms_ssim", loss_ms_ssim.item(), global_step)
                 writer.add_scalar("train/loss_reverse", loss_reverse.item(), global_step)
                 writer.add_scalar("train/loss_contrastive", loss_con.item(), global_step)
                 writer.add_scalar("train/loss_radius", loss_radius.item(), global_step)

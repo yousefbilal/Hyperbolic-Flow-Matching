@@ -68,9 +68,9 @@ class GeometryHead(nn.Module):
 
         z_hyp = self.hyperbolic_linear(z_euc)
         # Keep points off the absolute edge (1.0) for numerical stability.
-        norm = z_hyp.norm(dim=-1, keepdim=True)
-        cond = norm > self.max_norm
-        z_hyp = torch.where(cond, z_hyp * (self.max_norm / (norm + 1e-6)), z_hyp)
+        # norm = z_hyp.norm(dim=-1, keepdim=True)
+        # cond = norm > self.max_norm
+        # z_hyp = torch.where(cond, z_hyp * (self.max_norm / (norm + 1e-6)), z_hyp)
         logits = F.log_softmax(self.mlr(z_hyp, self.mlr.c), dim=-1)
         z_euc_dec = gmath.logmap0(z_hyp, k=self.curvature)
         return logits, z_hyp, z_euc_dec
