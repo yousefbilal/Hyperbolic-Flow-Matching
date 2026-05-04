@@ -153,14 +153,6 @@ class HAEImageNet(nn.Module):
         z_spatial_dec = z_flat_dec.reshape(B, self.channels, self.spatial, self.spatial)
         recon = self.vae.decode(z_spatial_dec)               # (B, 3, S, S)
 
-        # Stash the W+ analogues for the optional L_rec ("reverse_lambda")
-        # loss in the trainer: MSE(z_flat, z_flat_dec) — the round-trip
-        # reconstruction across both MLPs. Detach the target so gradients
-        # only flow through z_flat_dec ← proj_dec ← z_euc_dec ← head ← ...
-        # (See coach.py:247 in the original codebase for the analogue.)
-        self._z_flat_target = z_flat.detach()
-        self._z_flat_recon = z_flat_dec
-
         # Frozen-VAE path is AE-only; return zero KL for interface parity
         kl = torch.zeros((), device=x.device)
         return recon, logits, z_hyp, z_euc, z_euc_dec, kl
