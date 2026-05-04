@@ -290,7 +290,7 @@ class HyperbolicImages(Dataset):
             # Uniform distribution from VRFM
             #x0 = 2*torch.rand(dim) - 1
             #x0 = PoincareBallManifold().wrap(x0)
-            x0 = self.manifold.wrapped_normal(self.dim, mean=torch.zeros(self.dim), std=0.3)
+            x0 = self.manifold.wrapped_normal(self.dim, mean=torch.zeros(self.dim), std=0.03)
             return {"x0": x0, "x1": x1, "label": label}
 
         # Pair two different embeddings (e.g., across classes)

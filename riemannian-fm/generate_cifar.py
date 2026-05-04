@@ -67,8 +67,12 @@ def load_hae(checkpoint_path, device):
         elif "head.mlr.a_vals" in sd:
             num_classes = sd["head.mlr.a_vals"].shape[0]
 
-    image_size = int(saved_args.get("image_size", 32 if dataset.startswith("cifar") else 256))
-    variational = float(saved_args.get("kl_lambda", 0.0)) > 0.0
+    # Old checkpoints stored image_size=None when --image_size wasn't passed;
+    # `.get(k, default)` doesn't help with None values, so use `or`.
+    default_img = {"imagenet_lt": 256, "tiny_imagenet_lt": 64}.get(dataset, 32)
+    image_size = int(saved_args.get("image_size") or default_img)
+    variational = float(saved_args.get("kl_lambda") or 0.0) > 0.0
+    proj_hidden = tuple(saved_args.get("proj_hidden_dims") or ())
 
     # Resolve encoder backbone from saved args; legacy default per dataset.
     bb = saved_args.get("encoder_backbone")

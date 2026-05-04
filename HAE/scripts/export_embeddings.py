@@ -82,7 +82,7 @@ def build_dataset(args, saved_args):
 
 
 def build_model(args, saved_args, num_classes, device):
-    curvature = saved_args.get("curvature") or -1.0
+    curvature = saved_args.get("curvature" -1.0)
     latent_dim = saved_args.get("latent_dim") or 512
     feature_size = saved_args.get("feature_size") or 512
     variational = float(saved_args.get("kl_lambda") or 0.0) > 0.0
