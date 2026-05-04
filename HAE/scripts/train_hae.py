@@ -129,7 +129,18 @@ def parse_args():
     p.add_argument("--ssim_lambda", type=float, default=0.1,
                    help="Weight of SSIM loss (0 = off)")
     p.add_argument("--reverse_lambda", type=float, default=0.0,
-                   help="Weight of reverse/cycle-consistency loss MSE(z_euc, z_euc_dec) (0 = off)")
+                   help="Weight of reverse/cycle-consistency loss MSE(z_euc, z_euc_dec) "
+                        "(inner manifold cycle — through expmap0/logmap0 only). 0 = off.")
+    p.add_argument("--feat_recon_lambda", type=float, default=0.0,
+                   help="Weight of the W+-cycle feature-reconstruction loss "
+                        "(paper's L_rec, coach.py:247): MSE(z_flat, z_flat_dec) "
+                        "between the pre-proj_enc frozen-VAE features and the "
+                        "post-proj_dec reconstruction. Spans BOTH proj_enc and "
+                        "proj_dec plus the manifold round-trip — a real "
+                        "bottleneck reconstruction term, not a near-identity. "
+                        "Only active for HAEImageNet (sd_vae/taesd backbones); "
+                        "ignored for HAECifar where there is no analogous "
+                        "pre-MLP bottleneck. 0 = off.")
     p.add_argument("--ms_ssim_lambda", type=float, default=0.0,
                    help="Weight of MS-SSIM perceptual loss (0 = off, needs kernel_size tuning)")
     p.add_argument("--lpips_bb", type=str, default="alex",
@@ -507,10 +518,28 @@ def main():
                 loss = loss + args.ms_ssim_lambda * loss_ms_ssim
 
             # Reverse / cycle-consistency loss: MSE(z_euc, z_euc_dec)
+            # — the *inner* manifold cycle through expmap0/logmap0 only.
+            # For HAEImageNet this is approximately a no-op (logmap0 ∘
+            # expmap0 ≈ identity); kept for back-compat and because it
+            # softly penalises encoder magnitudes that saturate expmap0.
             loss_reverse = torch.tensor(0.0, device=device)
             if args.reverse_lambda > 0:
                 loss_reverse = F.mse_loss(z_euc, z_euc_dec)
                 loss = loss + args.reverse_lambda * loss_reverse
+
+            # Feature-reconstruction loss (paper's L_rec, coach.py:247):
+            # MSE(z_flat, z_flat_dec) — across both proj_enc and proj_dec
+            # plus the manifold round-trip. Real bottleneck reconstruction
+            # term; only active for HAEImageNet (which stashes the W+
+            # analogues on `_z_flat_target` / `_z_flat_recon`). HAECifar
+            # has no analogous pre-MLP bottleneck so this is skipped.
+            loss_feat_recon = torch.tensor(0.0, device=device)
+            if args.feat_recon_lambda > 0:
+                z_flat_t = getattr(model, "_z_flat_target", None)
+                z_flat_r = getattr(model, "_z_flat_recon", None)
+                if z_flat_t is not None and z_flat_r is not None:
+                    loss_feat_recon = F.mse_loss(z_flat_r, z_flat_t)
+                    loss = loss + args.feat_recon_lambda * loss_feat_recon
 
             # Hyperbolic contrastive (+ optional radius prior)
             loss_con = torch.tensor(0.0, device=device)
@@ -549,6 +578,7 @@ def main():
                       f"ssim={loss_ssim.item():.4f}  "
                       f"ms_ssim={loss_ms_ssim.item():.4f}  "
                       f"reverse={loss_reverse.item():.4f}  "
+                      f"feat_rec={loss_feat_recon.item():.4f}  "
                       f"con={loss_con.item():.4f}  "
                       f"rad={loss_radius.item():.4f}  "
                       f"kl={kl.item():.4f}  "
@@ -562,6 +592,7 @@ def main():
                 writer.add_scalar("train/loss_ssim", loss_ssim.item(), global_step)
                 writer.add_scalar("train/loss_ms_ssim", loss_ms_ssim.item(), global_step)
                 writer.add_scalar("train/loss_reverse", loss_reverse.item(), global_step)
+                writer.add_scalar("train/loss_feat_recon", loss_feat_recon.item(), global_step)
                 writer.add_scalar("train/loss_contrastive", loss_con.item(), global_step)
                 writer.add_scalar("train/loss_radius", loss_radius.item(), global_step)
                 writer.add_scalar("train/loss_kl", kl.item(), global_step)
@@ -580,6 +611,7 @@ def main():
                         "train/loss_lpips": loss_lpips.item(),
                         "train/loss_ssim": loss_ssim.item(),
                         "train/loss_reverse": loss_reverse.item(),
+                        "train/loss_feat_recon": loss_feat_recon.item(),
                         "train/accuracy": 100. * correct / total,
                         "train/lr": lr_now,
                         "global_step": global_step,

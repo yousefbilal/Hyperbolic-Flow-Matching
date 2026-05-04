@@ -48,7 +48,10 @@ def load_hae(checkpoint_path, device):
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     saved_args = ckpt.get("args", {})
     dataset = saved_args.get("dataset", "cifar10")
-    curvature = float(saved_args.get("curvature", -1.0))
+    # NB: explicit None-check rather than `or` — curvature=0 is the legitimate
+    # Euclidean baseline and is falsy, so `0 or -1.0` evaluates to -1.0.
+    _c = saved_args.get("curvature", -1.0)
+    curvature = float(_c if _c is not None else -1.0)
     latent_dim = saved_args.get("latent_dim", 512)
     feature_size = saved_args.get("feature_size", 512)
 
