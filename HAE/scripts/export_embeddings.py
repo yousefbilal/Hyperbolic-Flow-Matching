@@ -50,20 +50,25 @@ def parse_args():
     return p.parse_args()
 
 
+def _resolve_image_size(saved_args, dataset, default):
+    """Backwards-compat: old checkpoints stored image_size=None when the
+    --image_size CLI arg wasn't passed. `.get(k, default)` only kicks in
+    when the key is missing, not when it's None — so use `or`."""
+    return int(saved_args.get("image_size") or default)
+
+
 def build_dataset(args, saved_args):
     is_train = args.split == "train"
     if args.dataset in ("cifar10", "cifar100"):
         cls = CIFAR10LT if args.dataset == "cifar10" else CIFAR100LT
-        # Honour image_size from training so a Tiny-ImageNet-style 64×
-        # CIFAR is rare-but-supported.
-        img_sz = int(saved_args.get("image_size", 32))
+        img_sz = _resolve_image_size(saved_args, args.dataset, 32)
         tf = make_cifar_lt_transform(image_size=img_sz, train=False)
         ds = cls(root=args.data_root, imbalance_factor=args.imbalance_factor,
                  train=is_train, transform=tf, download=True)
         num_classes = 10 if args.dataset == "cifar10" else 100
         return ds, num_classes
     if args.dataset == "tiny_imagenet_lt":
-        img_sz = int(saved_args.get("image_size", TINY_IMAGENET_RESOLUTION))
+        img_sz = _resolve_image_size(saved_args, args.dataset, TINY_IMAGENET_RESOLUTION)
         tf = make_tiny_imagenet_lt_transform(image_size=img_sz, train=False)
         # Train split honours the imbalance factor; test split is balanced.
         imb = args.imbalance_factor if is_train else 1.0
@@ -77,11 +82,16 @@ def build_dataset(args, saved_args):
 
 
 def build_model(args, saved_args, num_classes, device):
-    curvature = saved_args.get("curvature", -1.0)
-    latent_dim = saved_args.get("latent_dim", 512)
-    feature_size = saved_args.get("feature_size", 512)
-    variational = float(saved_args.get("kl_lambda", 0.0)) > 0.0
-    image_size = int(saved_args.get("image_size", 32))
+    curvature = saved_args.get("curvature") or -1.0
+    latent_dim = saved_args.get("latent_dim") or 512
+    feature_size = saved_args.get("feature_size") or 512
+    variational = float(saved_args.get("kl_lambda") or 0.0) > 0.0
+
+    # Default image_size depends on dataset; legacy CIFAR ckpts had no key.
+    default_img = {"imagenet_lt": 256, "tiny_imagenet_lt": 64}.get(args.dataset, 32)
+    image_size = _resolve_image_size(saved_args, args.dataset, default_img)
+    # proj_hidden_dims may be missing (old ckpt) or None — coerce to ().
+    proj_hidden = tuple(saved_args.get("proj_hidden_dims") or ())
 
     # Resolve backbone: prefer the explicitly saved value; fall back to
     # the legacy default for older checkpoints.
@@ -97,6 +107,7 @@ def build_model(args, saved_args, num_classes, device):
             feature_size=feature_size, curvature=curvature,
             vae_name=TAESD_NAME if is_tiny else SD_VAE_NAME,
             tiny_vae=is_tiny, image_size=image_size,
+            proj_hidden_dims=proj_hidden,
         )
     else:   # cnn_cifar
         model = HAECifar(num_classes=num_classes, latent_dim=latent_dim,
