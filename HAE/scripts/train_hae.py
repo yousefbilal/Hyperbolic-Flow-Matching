@@ -81,14 +81,6 @@ def parse_args():
                         "default per dataset: cnn_cifar for CIFAR-10/100, "
                         "taesd for tiny_imagenet_lt (cheap pretrained), "
                         "sd_vae for imagenet_lt (full SD-VAE).")
-    p.add_argument("--proj_hidden_dims", type=int, nargs="*", default=[],
-                   help="Hidden widths for the projection MLPs between the "
-                        "frozen VAE features and the latent (and decoder "
-                        "mirror). Default empty = a single Linear (current "
-                        "behaviour). Example: --proj_hidden_dims 1024 512 "
-                        "builds proj_enc as flat→1024→512→latent_dim with "
-                        "LeakyReLU between, and proj_dec as feature_size→"
-                        "512→1024→flat. Only used by HAEImageNet.")
 
     # imbalance handling
     p.add_argument("--sampler", type=str, default="instance",
@@ -298,16 +290,6 @@ def hyperbolic_weight(epoch: int, warmup_epochs: int, target: float,
 def main():
     args = parse_args()
 
-    # Resolve image_size to a concrete int so the saved checkpoint args
-    # never contain None — old checkpoints saved with image_size=None are
-    # handled defensively in export/generate (`.get(key) or default`).
-    if args.image_size is None:
-        args.image_size = {
-            "cifar10": 32, "cifar100": 32,
-            "tiny_imagenet_lt": 64,
-            "imagenet_lt": 256,
-        }[args.dataset]
-
     os.makedirs(args.exp_dir, exist_ok=True)
     ckpt_dir = os.path.join(args.exp_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -413,13 +395,10 @@ def main():
             vae_name=vae_name,
             tiny_vae=is_tiny,
             image_size=image_size,
-            proj_hidden_dims=tuple(args.proj_hidden_dims),
         ).to(device)
-        proj_str = ("→".join(str(h) for h in args.proj_hidden_dims) or "linear")
         print(f"Using HAEImageNet [{bb.upper()}] @ {image_size}× "
               f"(frozen pretrained AE + hyperbolic head, "
-              f"latent_grid={image_size // 8}×{image_size // 8}×4, "
-              f"proj=[{proj_str}])")
+              f"latent_grid={image_size // 8}×{image_size // 8}×4)")
     elif bb == "cnn_cifar":
         variational = args.kl_lambda > 0.0
         model = HAECifar(
