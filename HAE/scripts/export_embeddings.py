@@ -82,7 +82,12 @@ def build_dataset(args, saved_args):
 
 
 def build_model(args, saved_args, num_classes, device):
-    curvature = saved_args.get("curvature" -1.0)
+    # NB: don't use `or default` for curvature — curvature=0 is the legitimate
+    # Euclidean baseline and is falsy, so `0 or -1.0` evaluates to -1.0.
+    # (And the previous code had a typo: `get("curvature" -1.0)` parsed as
+    # `get(("curvature" - 1.0))` which would have raised TypeError.)
+    _c = saved_args.get("curvature")
+    curvature = float(_c) if _c is not None else -1.0
     latent_dim = saved_args.get("latent_dim") or 512
     feature_size = saved_args.get("feature_size") or 512
     variational = float(saved_args.get("kl_lambda") or 0.0) > 0.0

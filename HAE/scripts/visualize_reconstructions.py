@@ -35,13 +35,18 @@ from models.hae_imagenet import HAEImageNet
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from lt_datasets.cifar_lt import CIFAR10LT, CIFAR100LT, make_cifar_lt_transform
 from lt_datasets.imagenet_lt import ImageNetLT, make_imagenet_lt_transform
+from lt_datasets.tiny_imagenet_lt import (
+    TinyImageNetLT, make_tiny_imagenet_lt_transform,
+    NATIVE_RESOLUTION as TINY_IMAGENET_RESOLUTION,
+)
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--dataset", type=str, default="cifar10",
-                   choices=["cifar10", "cifar100", "imagenet_lt"])
+                   choices=["cifar10", "cifar100", "imagenet_lt",
+                            "tiny_imagenet_lt"])
     p.add_argument("--imbalance_factor", type=float, default=0.01)
     p.add_argument("--data_root", type=str, required=True)
     p.add_argument("--output_dir", type=str, required=True)
@@ -54,32 +59,63 @@ def parse_args():
     return p.parse_args()
 
 
-def build_dataset(args):
+def _resolve_image_size(saved_args, dataset, default):
+    """Old checkpoints stored image_size=None when --image_size wasn't passed.
+    `.get(k, default)` doesn't help with None values, so use `or`."""
+    return int(saved_args.get("image_size") or default)
+
+
+def build_dataset(args, saved_args):
     if args.dataset in ("cifar10", "cifar100"):
         cls = CIFAR10LT if args.dataset == "cifar10" else CIFAR100LT
-        tf = make_cifar_lt_transform(image_size=32, train=False)
+        img_sz = _resolve_image_size(saved_args, args.dataset, 32)
+        tf = make_cifar_lt_transform(image_size=img_sz, train=False)
         ds = cls(root=args.data_root, imbalance_factor=args.imbalance_factor,
                  train=False, transform=tf, download=True)
         num_classes = 10 if args.dataset == "cifar10" else 100
-    else:
-        tf = make_imagenet_lt_transform(image_size=256, train=False)
+    elif args.dataset == "tiny_imagenet_lt":
+        img_sz = _resolve_image_size(saved_args, args.dataset, TINY_IMAGENET_RESOLUTION)
+        tf = make_tiny_imagenet_lt_transform(image_size=img_sz, train=False)
+        # Val split is balanced per the standard LT convention.
+        ds = TinyImageNetLT(root=args.data_root, imbalance_factor=1.0,
+                            train=False, transform=tf, image_size=img_sz)
+        num_classes = ds.num_classes
+    else:    # imagenet_lt
+        img_sz = _resolve_image_size(saved_args, args.dataset, 256)
+        tf = make_imagenet_lt_transform(image_size=img_sz, train=False)
         ds = ImageNetLT(root=args.data_root, train=False, transform=tf)
         num_classes = ds.num_classes
     return ds, num_classes
 
 
 def build_model(saved_args, num_classes, device, dataset):
-    curvature = saved_args.get("curvature", -1.0)
-    latent_dim = saved_args.get("latent_dim", 512)
-    feature_size = saved_args.get("feature_size", 512)
-    variational = float(saved_args.get("kl_lambda", 0.0)) > 0.0
-    if dataset in ("cifar10", "cifar100"):
+    # NB: don't use `or default` for curvature — curvature=0 is the legitimate
+    # Euclidean baseline and is falsy, so `0 or -1.0` evaluates to -1.0.
+    _c = saved_args.get("curvature")
+    curvature = float(_c) if _c is not None else -1.0
+    latent_dim = saved_args.get("latent_dim") or 512
+    feature_size = saved_args.get("feature_size") or 512
+    variational = float(saved_args.get("kl_lambda") or 0.0) > 0.0
+
+    default_img = {"imagenet_lt": 256, "tiny_imagenet_lt": 64}.get(dataset, 32)
+    image_size = _resolve_image_size(saved_args, dataset, default_img)
+
+    # Resolve backbone — saved value wins; legacy default per dataset.
+    bb = saved_args.get("encoder_backbone")
+    if bb is None:
+        bb = "sd_vae" if dataset == "imagenet_lt" else "cnn_cifar"
+
+    if bb in ("sd_vae", "taesd"):
+        from models.hae_imagenet import SD_VAE_NAME, TAESD_NAME
+        is_tiny = bb == "taesd"
+        m = HAEImageNet(num_classes=num_classes, latent_dim=latent_dim,
+                        feature_size=feature_size, curvature=curvature,
+                        vae_name=TAESD_NAME if is_tiny else SD_VAE_NAME,
+                        tiny_vae=is_tiny, image_size=image_size)
+    else:    # cnn_cifar
         m = HAECifar(num_classes=num_classes, latent_dim=latent_dim,
                      feature_size=feature_size, curvature=curvature,
-                     variational=variational)
-    else:
-        m = HAEImageNet(num_classes=num_classes, latent_dim=latent_dim,
-                        feature_size=feature_size, curvature=curvature)
+                     variational=variational, image_size=image_size)
     return m.to(device).eval()
 
 
@@ -148,7 +184,7 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     saved_args = ckpt.get("args", {})
 
-    ds, num_classes = build_dataset(args)
+    ds, num_classes = build_dataset(args, saved_args)
     print(f"Validation set: {len(ds)} images across {num_classes} classes")
 
     model = build_model(saved_args, num_classes, device, args.dataset)
