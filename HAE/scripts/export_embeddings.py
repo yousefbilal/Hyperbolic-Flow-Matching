@@ -95,8 +95,6 @@ def build_model(args, saved_args, num_classes, device):
     # Default image_size depends on dataset; legacy CIFAR ckpts had no key.
     default_img = {"imagenet_lt": 256, "tiny_imagenet_lt": 64}.get(args.dataset, 32)
     image_size = _resolve_image_size(saved_args, args.dataset, default_img)
-    # proj_hidden_dims may be missing (old ckpt) or None — coerce to ().
-    proj_hidden = tuple(saved_args.get("proj_hidden_dims") or ())
 
     # Resolve backbone: prefer the explicitly saved value; fall back to
     # the legacy default for older checkpoints.
@@ -112,7 +110,6 @@ def build_model(args, saved_args, num_classes, device):
             feature_size=feature_size, curvature=curvature,
             vae_name=TAESD_NAME if is_tiny else SD_VAE_NAME,
             tiny_vae=is_tiny, image_size=image_size,
-            proj_hidden_dims=proj_hidden,
         )
     else:   # cnn_cifar
         model = HAECifar(num_classes=num_classes, latent_dim=latent_dim,

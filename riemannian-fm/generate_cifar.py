@@ -75,7 +75,6 @@ def load_hae(checkpoint_path, device):
     default_img = {"imagenet_lt": 256, "tiny_imagenet_lt": 64}.get(dataset, 32)
     image_size = int(saved_args.get("image_size") or default_img)
     variational = float(saved_args.get("kl_lambda") or 0.0) > 0.0
-    proj_hidden = tuple(saved_args.get("proj_hidden_dims") or ())
 
     # Resolve encoder backbone from saved args; legacy default per dataset.
     bb = saved_args.get("encoder_backbone")
