@@ -50,5 +50,5 @@ def load_model(checkpoint: str, eval_projx=None, atol=None, rtol=None):
         cfg.model.rtol = rtol
 
     model = ManifoldFMLitModule(cfg)
-    model.load_state_dict(chkpnt["state_dict"])
+    model.load_state_dict(chkpnt["state_dict"], strict=False)
     return cfg, model
