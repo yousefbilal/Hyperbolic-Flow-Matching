@@ -133,14 +133,18 @@ def parse_args():
                         "(inner manifold cycle — through expmap0/logmap0 only). 0 = off.")
     p.add_argument("--feat_recon_lambda", type=float, default=0.0,
                    help="Weight of the W+-cycle feature-reconstruction loss "
-                        "(paper's L_rec, coach.py:247): MSE(z_flat, z_flat_dec) "
-                        "between the pre-proj_enc frozen-VAE features and the "
-                        "post-proj_dec reconstruction. Spans BOTH proj_enc and "
-                        "proj_dec plus the manifold round-trip — a real "
-                        "bottleneck reconstruction term, not a near-identity. "
-                        "Only active for HAEImageNet (sd_vae/taesd backbones); "
-                        "ignored for HAECifar where there is no analogous "
-                        "pre-MLP bottleneck. 0 = off.")
+                        "(paper's L_rec, coach.py:247): MSE(z_flat, z_flat_dec). "
+                        "Only active for HAEImageNet (sd_vae/taesd). 0 = off. "
+                        "When `--feat_recon_adaptive` is set this is the BASE "
+                        "weight; the effective weight is bumped on every step "
+                        "as the loss decreases.")
+    p.add_argument("--feat_recon_adaptive", action="store_true",
+                   help="Use the coach.py:248-263 step-wise adaptive schedule: "
+                        "as the W+-cycle MSE drops below successive thresholds "
+                        "(0.2, 0.1, 0.05, ...), the effective lambda is bumped "
+                        "(3, 6, 12, 24, 48, 96, 150). Keeps the loss "
+                        "contribution roughly constant across training so the "
+                        "term doesn't fade as the model fits the W+ cycle.")
     p.add_argument("--ms_ssim_lambda", type=float, default=0.0,
                    help="Weight of MS-SSIM perceptual loss (0 = off, needs kernel_size tuning)")
     p.add_argument("--lpips_bb", type=str, default="alex",
@@ -152,7 +156,21 @@ def parse_args():
                         "0 = deterministic AE (default). CIFAR only — "
                         "ignored for ImageNet path.")
 
-    # logging / checkpoints
+    # resume / logging / checkpoints
+    p.add_argument("--resume", type=str, default=None,
+                   help="Path to a checkpoint .pt file to resume from. Loads "
+                        "model state, optimizer, scheduler, global_step, "
+                        "epoch, and RNG states so the next iteration continues "
+                        "where the run stopped.")
+    p.add_argument("--reset_lr_schedule", action="store_true",
+                   help="On --resume, build a fresh cosine schedule with the "
+                        "*new* --num_epochs / --lr instead of restoring the "
+                        "saved scheduler state. Use when extending a run "
+                        "whose original cosine has already decayed to ~0, "
+                        "or when you want a fresh LR boost. "
+                        "Does NOT reset global_step / epoch / model weights — "
+                        "training continues from the same point, just with a "
+                        "new LR trajectory.")
     p.add_argument("--exp_dir", type=str, required=True)
     p.add_argument("--log_interval", type=int, default=50,
                    help="Print metrics every N steps")
@@ -464,8 +482,63 @@ def main():
     # ---- Training loop ----------------------------------------------------
     global_step = 0
     best_val_loss = float("inf")
+    start_epoch = 0
 
-    for epoch in range(args.num_epochs):
+    # ---- Resume from checkpoint ------------------------------------------
+    if args.resume is not None:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"--resume path does not exist: {args.resume}")
+        print(f"Resuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        # state_dict — strict by default; if the saved ckpt doesn't have a
+        # field that the current model expects (e.g. legacy ckpts without
+        # the new VAE heads), fall back to non-strict and warn loudly.
+        try:
+            model.load_state_dict(ckpt["state_dict"], strict=True)
+        except RuntimeError as e:
+            print(f"  strict load failed ({e}); retrying with strict=False")
+            missing, unexpected = model.load_state_dict(ckpt["state_dict"],
+                                                         strict=False)
+            if missing:
+                print(f"  missing  keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+            if unexpected:
+                print(f"  unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt and not args.reset_lr_schedule:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler"])
+                print(f"  scheduler restored (T_max={scheduler.T_max}, "
+                      f"last_epoch={scheduler.last_epoch})")
+            except Exception as e:
+                print(f"  scheduler restore failed ({e}) — using freshly "
+                      f"built schedule from --num_epochs")
+        elif args.reset_lr_schedule:
+            # Reset cosine: schedule starts from step 0 of the new T_max
+            # (= args.num_epochs * len(train_loader)) at base lr=args.lr.
+            # The optimizer's saved LR state is overwritten — we explicitly
+            # set every param group's lr back to args.lr so the cosine
+            # starts at the requested peak.
+            for pg in optimizer.param_groups:
+                pg["lr"] = args.lr
+            print(f"  scheduler RESET — fresh cosine over "
+                  f"{scheduler.T_max} steps at base lr={args.lr}")
+        global_step = int(ckpt.get("global_step", 0))
+        start_epoch = int(ckpt.get("epoch", 0))
+        best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
+        rng = ckpt.get("rng", None)
+        if rng is not None:
+            try:
+                torch.set_rng_state(rng["torch"])
+                if rng.get("torch_cuda") is not None and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all(rng["torch_cuda"])
+                np.random.set_state(rng["numpy"])
+            except Exception as e:
+                print(f"  RNG restore failed ({e}) — continuing")
+        print(f"  Resumed @ epoch={start_epoch} step={global_step} "
+              f"best_val_loss={best_val_loss:.4f}")
+
+    for epoch in range(start_epoch, args.num_epochs):
         model.train()
         epoch_loss = 0.0
         correct = 0
@@ -534,12 +607,18 @@ def main():
             # analogues on `_z_flat_target` / `_z_flat_recon`). HAECifar
             # has no analogous pre-MLP bottleneck so this is skipped.
             loss_feat_recon = torch.tensor(0.0, device=device)
+            eff_feat_recon_lambda = args.feat_recon_lambda
             if args.feat_recon_lambda > 0:
                 z_flat_t = getattr(model, "_z_flat_target", None)
                 z_flat_r = getattr(model, "_z_flat_recon", None)
                 if z_flat_t is not None and z_flat_r is not None:
                     loss_feat_recon = F.mse_loss(z_flat_r, z_flat_t)
-                    loss = loss + args.feat_recon_lambda * loss_feat_recon
+                    if args.feat_recon_adaptive:
+                        eff_feat_recon_lambda = adaptive_feat_recon_lambda(
+                            float(loss_feat_recon.item()),
+                            args.feat_recon_lambda,
+                        )
+                    loss = loss + eff_feat_recon_lambda * loss_feat_recon
 
             # Hyperbolic contrastive (+ optional radius prior)
             loss_con = torch.tensor(0.0, device=device)
@@ -593,6 +672,7 @@ def main():
                 writer.add_scalar("train/loss_ms_ssim", loss_ms_ssim.item(), global_step)
                 writer.add_scalar("train/loss_reverse", loss_reverse.item(), global_step)
                 writer.add_scalar("train/loss_feat_recon", loss_feat_recon.item(), global_step)
+                writer.add_scalar("train/lam_feat_recon", float(eff_feat_recon_lambda), global_step)
                 writer.add_scalar("train/loss_contrastive", loss_con.item(), global_step)
                 writer.add_scalar("train/loss_radius", loss_radius.item(), global_step)
                 writer.add_scalar("train/loss_kl", kl.item(), global_step)
@@ -634,13 +714,17 @@ def main():
                 if val_recon < best_val_loss:
                     best_val_loss = val_recon
                     save_checkpoint(model, optimizer, args, global_step, epoch,
-                                    ckpt_dir, "best_model.pt")
+                                    ckpt_dir, "best_model.pt",
+                                    scheduler=scheduler,
+                                    best_val_loss=best_val_loss)
                 model.train()
 
             # --- Periodic checkpoint ---
             if global_step % args.save_interval == 0:
                 save_checkpoint(model, optimizer, args, global_step, epoch,
-                                ckpt_dir, f"step_{global_step:06d}.pt")
+                                ckpt_dir, f"step_{global_step:06d}.pt",
+                                scheduler=scheduler,
+                                best_val_loss=best_val_loss)
 
             # early stop on max_steps
             if args.max_steps is not None and global_step >= args.max_steps:
@@ -657,7 +741,9 @@ def main():
 
     # final checkpoint
     save_checkpoint(model, optimizer, args, global_step, epoch,
-                    ckpt_dir, "final_model.pt")
+                    ckpt_dir, "final_model.pt",
+                    scheduler=scheduler,
+                    best_val_loss=best_val_loss)
 
     # one full-test pass at the end so the headline number is on all 50k
     if val_loader_quick is not test_loader:
@@ -743,15 +829,52 @@ def validate(model, loader, device, l1_loss_fn, writer, global_step,
 # Checkpoint
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, optimizer, args, step, epoch, ckpt_dir, name):
+def adaptive_feat_recon_lambda(loss_val: float, base: float) -> float:
+    """coach.py:248-263 step-wise schedule.
+
+    As the W+-cycle MSE drops, increase λ to keep the contribution roughly
+    constant. The thresholds are powers of 2 from 0.2 down to 0.003125; the
+    matching multipliers are 3, 6, 12, 24, 48, 96, 150 (the paper's choice
+    — not exactly geometric but close).
+    """
+    if loss_val <= 0.003125:
+        return 150.0
+    if loss_val <= 0.00625:
+        return 96.0
+    if loss_val <= 0.0125:
+        return 48.0
+    if loss_val <= 0.025:
+        return 24.0
+    if loss_val <= 0.05:
+        return 12.0
+    if loss_val <= 0.1:
+        return 6.0
+    if loss_val <= 0.2:
+        return 3.0
+    return base
+
+
+def save_checkpoint(model, optimizer, args, step, epoch, ckpt_dir, name,
+                    scheduler=None, best_val_loss=None):
     path = os.path.join(ckpt_dir, name)
-    torch.save({
+    payload = {
         "state_dict": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "global_step": step,
         "epoch": epoch,
         "args": vars(args),
-    }, path)
+        "rng": {
+            "torch": torch.get_rng_state(),
+            "torch_cuda": (torch.cuda.get_rng_state_all()
+                           if torch.cuda.is_available() else None),
+            "numpy": np.random.get_state(),
+        },
+    }
+    if scheduler is not None:
+        payload["scheduler"] = scheduler.state_dict()
+    if best_val_loss is not None:
+        payload["best_val_loss"] = float(best_val_loss)
+    torch.save(payload, path)
     print(f"  Saved checkpoint → {path}")
 
 
