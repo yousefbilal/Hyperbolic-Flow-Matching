@@ -4,7 +4,7 @@ opencv-python
 tensorboard
 wandb
 umap-learn
-torchmetrics
+torchmetrics[image]
 matplotlib
 jupyter
 torchdiffeq
