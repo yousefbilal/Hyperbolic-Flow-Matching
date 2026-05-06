@@ -90,25 +90,40 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 class GeneratedImagesDataset(Dataset):
-    """Walk class_*/images/*.png under a root."""
+    """Walk class_*/images/*.png under a root.
+
+    Returns (image, class_id). class_id is parsed from the parent dir name
+    'class_NNN'. If the layout is flat (`<root>/images/*.png` — single-class
+    dump from a one-shot generate), class_id falls back to -1 and per-shot
+    grouping won't work for that data.
+    """
     def __init__(self, root: str, transform=None, max_n=None):
         root = Path(root)
-        paths = sorted(root.glob("class_*/images/*.png"))
-        if not paths:
-            paths = sorted(root.glob("images/*.png"))
+        entries = []
+        for class_dir in sorted(root.glob("class_*")):
+            try:
+                class_id = int(class_dir.name.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            for p in sorted(class_dir.glob("images/*.png")):
+                entries.append((p, class_id))
+        if not entries:
+            for p in sorted(root.glob("images/*.png")):
+                entries.append((p, -1))
         if max_n is not None:
-            paths = paths[:max_n]
-        self.paths = paths
+            entries = entries[:max_n]
+        self.entries = entries
         self.transform = transform
 
     def __len__(self):
-        return len(self.paths)
+        return len(self.entries)
 
     def __getitem__(self, idx):
-        img = Image.open(self.paths[idx]).convert("RGB")
+        path, cls = self.entries[idx]
+        img = Image.open(path).convert("RGB")
         if self.transform is not None:
             img = self.transform(img)
-        return img
+        return img, cls
 
 
 def _build_transform(image_size: int):
@@ -155,31 +170,35 @@ def build_generated_loader(args):
 def extract_features_and_update_metrics(loader, fid_metric, is_metric,
                                           device, label, is_real=False):
     """Single forward pass per image — updates FID, IS, and returns the
-    2048-d Inception features for P/R.
+    2048-d Inception features and class labels for P/R + per-shot metrics.
 
     Inputs are float [0, 1]; FID/IS metrics are built with normalize=True
     so they handle the [0,1] → uint8 conversion internally.
+    Both real and generated loaders yield (image, class_id).
     """
     feats_chunks = []
+    label_chunks = []
     n = 0
     for batch in loader:
-        x = batch[0] if isinstance(batch, (tuple, list)) else batch
+        x, y = batch[0], batch[1]
         x = x.to(device)                                  # float [0, 1]
 
         fid_metric.update(x, real=is_real)
         if not is_real and is_metric is not None:
             is_metric.update(x)
 
-        # Pool features for P/R — the FID metric's Inception expects uint8,
-        # so multiply by 255 here. Same conversion the metric does internally.
+        # Pool features for P/R — the FID metric's Inception expects uint8.
         f = fid_metric.inception((x * 255).byte())
         feats_chunks.append(f.cpu())
+        label_chunks.append(y.long())
         n += x.shape[0]
 
         if n % (loader.batch_size * 20) == 0:
             print(f"  [{label}] {n} images...", flush=True)
 
-    return torch.cat(feats_chunks, dim=0), n
+    return (torch.cat(feats_chunks, dim=0),
+            torch.cat(label_chunks, dim=0),
+            n)
 
 
 def _knn_radii(feats: torch.Tensor, k: int) -> torch.Tensor:
@@ -216,6 +235,35 @@ def _manifold_membership(feats_query: torch.Tensor,
         within = (d <= radii_ref.unsqueeze(0))
         out[i:i + chunk] = within.any(dim=-1)
     return out
+
+
+def compute_fid_from_features(real_feats: torch.Tensor,
+                               gen_feats: torch.Tensor) -> float:
+    """FID computed directly from precomputed pool features. Same formula
+    as torchmetrics.FrechetInceptionDistance.compute() — used for per-shot
+    FID after splitting the global feature tensors by class group."""
+    if len(real_feats) < 2 or len(gen_feats) < 2:
+        return float("nan")
+    from scipy.linalg import sqrtm
+    r = real_feats.numpy().astype(np.float64)
+    g = gen_feats.numpy().astype(np.float64)
+    mu_r, mu_g = r.mean(axis=0), g.mean(axis=0)
+    cov_r = np.cov(r, rowvar=False)
+    cov_g = np.cov(g, rowvar=False)
+    diff = mu_r - mu_g
+    covmean, _ = sqrtm(cov_r @ cov_g, disp=False)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    return float(diff @ diff + np.trace(cov_r) + np.trace(cov_g)
+                  - 2 * np.trace(covmean))
+
+
+def get_shot_groups(args) -> dict:
+    """Resolve head/mid/tail class groupings using the LT training counts."""
+    ds_lt = TinyImageNetLT(root=args.data_root, imbalance_factor=0.01,
+                            train=True, transform=None,
+                            image_size=args.image_size)
+    return ds_lt.get_head_mid_tail_split(n_groups=3)
 
 
 def compute_improved_pr(real_feats: torch.Tensor, gen_feats: torch.Tensor,
@@ -292,19 +340,19 @@ def main():
 
     print("\nExtracting Inception features for REAL "
           "(updates FID's real stats simultaneously)...")
-    real_feats, n_real = extract_features_and_update_metrics(
+    real_feats, real_labels, n_real = extract_features_and_update_metrics(
         real_loader, fid_metric, is_metric=None, device=device,
         label="real", is_real=True,
     )
 
     print("\nExtracting Inception features for GENERATED "
           "(updates FID's fake stats + IS simultaneously)...")
-    gen_feats, n_gen = extract_features_and_update_metrics(
+    gen_feats, gen_labels, n_gen = extract_features_and_update_metrics(
         gen_loader, fid_metric, is_metric=is_metric, device=device,
         label="gen", is_real=False,
     )
 
-    print("\n--- Computing metrics ---")
+    print("\n--- Global metrics ---")
     metrics = {}
 
     print("FID (canonical Inception, comparable to published)...")
@@ -328,12 +376,50 @@ def main():
     metrics["n_real"] = n_real
     metrics["n_gen"]  = n_gen
 
+    # ----- Per-shot (head / mid / tail) ------------------------------------
+    print("\n--- Per-shot metrics (head / mid / tail) ---")
+    shots = get_shot_groups(args)        # {"head": [...], "mid": [...], "tail": [...]}
+    metrics["per_shot"] = {}
+    if (gen_labels < 0).any():
+        print("  Skipping per-shot: some generated images have unknown class "
+              "(flat output_dir/images/*.png layout). Re-run generation with "
+              "the per-class layout (class_NNN/images/*.png).")
+    else:
+        for shot, class_ids in shots.items():
+            cls_set = torch.tensor(class_ids, dtype=torch.long)
+            real_mask = torch.isin(real_labels, cls_set)
+            gen_mask  = torch.isin(gen_labels, cls_set)
+            real_sub = real_feats[real_mask]
+            gen_sub  = gen_feats[gen_mask]
+            shot_fid = compute_fid_from_features(real_sub, gen_sub)
+            shot_pr  = compute_improved_pr(real_sub, gen_sub, k=args.knn_k)
+            metrics["per_shot"][shot] = {
+                "n_classes": len(class_ids),
+                "n_real":    int(real_mask.sum()),
+                "n_gen":     int(gen_mask.sum()),
+                "FID":       shot_fid,
+                "precision": shot_pr["precision"],
+                "recall":    shot_pr["recall"],
+                "F_8":       shot_pr["F_8"],
+                "F_1/8":     shot_pr["F_1/8"],
+            }
+            print(f"  [{shot:5s}]  n_cls={len(class_ids):3d}  "
+                  f"n_real={int(real_mask.sum()):5d}  "
+                  f"n_gen={int(gen_mask.sum()):5d}  "
+                  f"FID={shot_fid:7.3f}  "
+                  f"recall={shot_pr['recall']:.3f}  "
+                  f"F_8={shot_pr['F_8']:.3f}  "
+                  f"F_1/8={shot_pr['F_1/8']:.3f}")
+
     print("\n=== Summary ===")
-    print(f"  FID       {metrics['FID']:.3f}    ↓")
-    print(f"  IS        {metrics['IS_mean']:.3f} ± {metrics['IS_std']:.3f}   ↑")
-    print(f"  Recall    {metrics['recall']:.3f}    ↑")
-    print(f"  F_8       {metrics['F_8']:.3f}    ↑")
-    print(f"  F_1/8     {metrics['F_1/8']:.3f}    ↑")
+    print(f"  Global    FID={metrics['FID']:.3f}  IS={metrics['IS_mean']:.3f}±{metrics['IS_std']:.3f}  "
+          f"Recall={metrics['recall']:.3f}  F_8={metrics['F_8']:.3f}  F_1/8={metrics['F_1/8']:.3f}")
+    if metrics["per_shot"]:
+        for shot in ("head", "mid", "tail"):
+            if shot in metrics["per_shot"]:
+                ps = metrics["per_shot"][shot]
+                print(f"  {shot:<8s}  FID={ps['FID']:.3f}  Recall={ps['recall']:.3f}  "
+                      f"F_8={ps['F_8']:.3f}  F_1/8={ps['F_1/8']:.3f}")
 
     if args.output_json:
         os.makedirs(os.path.dirname(os.path.abspath(args.output_json)),
