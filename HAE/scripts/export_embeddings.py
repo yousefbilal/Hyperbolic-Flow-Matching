@@ -107,10 +107,11 @@ def build_model(args, saved_args, num_classes, device):
     if bb in ("sd_vae", "taesd"):
         from models.hae_imagenet import SD_VAE_NAME, TAESD_NAME
         is_tiny = bb == "taesd"
+        vae_name = TAESD_NAME if is_tiny else SD_VAE_NAME
         model = HAEImageNet(
             num_classes=num_classes, latent_dim=latent_dim,
             feature_size=feature_size, curvature=curvature,
-            vae_name=TAESD_NAME if is_tiny else SD_VAE_NAME,
+            vae_name=vae_name,
             tiny_vae=is_tiny, image_size=image_size,
             proj_hidden_dims=proj_hidden,
         )
