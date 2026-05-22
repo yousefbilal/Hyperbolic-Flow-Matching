@@ -85,6 +85,12 @@ class ManifoldFMLitModule(pl.LightningModule):
         self.fm_conditioning = str(cfg.get("fm_conditioning", "none"))
         self.num_classes = int(cfg.get("num_classes", 0))
         self.cfg_label_dropout = float(cfg.get("cfg_label_dropout", 0.1))
+
+        # Std of the wrapped-normal base distribution p_0 on the manifold.
+        # Read once here so train/sample/logprob all use the same value, and
+        # so the value persists into the Hydra config.yaml that load_model()
+        # reads back at inference time.
+        self.base_std = float(cfg.get("base_std", 0.03))
         self.cfg_cond_dim = int(cfg.get("cfg_cond_dim", 64))
 
         # Long-tail loss weighting (orthogonal to the data sampler):
@@ -433,7 +439,8 @@ class ManifoldFMLitModule(pl.LightningModule):
             x0 = batch["x0"]
         else:
             x0 = (
-                self.manifold.random_base(batch.shape[0], self.dim)
+                self.manifold.random_base(batch.shape[0], self.dim,
+                                          std=self.base_std)
                 .reshape(batch.shape[0], self.dim)
                 .to(batch.device)
             )
@@ -456,7 +463,8 @@ class ManifoldFMLitModule(pl.LightningModule):
         if x0 is None:
             # Sample from base distribution.
             x0 = (
-                self.manifold.random_base(n_samples, self.dim)
+                self.manifold.random_base(n_samples, self.dim,
+                                          std=self.base_std)
                 .reshape(n_samples, self.dim)
                 .to(device)
             )
@@ -519,7 +527,8 @@ class ManifoldFMLitModule(pl.LightningModule):
         if x0 is None:
             # Sample from base distribution.
             x0 = (
-                self.manifold.random_base(n_samples, self.dim)
+                self.manifold.random_base(n_samples, self.dim,
+                                          std=self.base_std)
                 .reshape(n_samples, self.dim)
                 .to(device)
             )
@@ -620,7 +629,7 @@ class ManifoldFMLitModule(pl.LightningModule):
                 integ_error = (x0[..., : self.dim] - x0_[..., : self.dim]).abs().max()
                 self.log("integ_error", integ_error)
 
-                logp0 = self.manifold.base_logprob(x0)
+                logp0 = self.manifold.base_logprob(x0, std=self.base_std)
                 logp1 = logp0 + logdetjac
 
                 if self.cfg.get("normalize_loglik", False):
@@ -650,7 +659,8 @@ class ManifoldFMLitModule(pl.LightningModule):
             x1 = batch["x1"]
         else:
             x1 = batch
-            x0 = self.manifold.random_base(x1.shape[0], self.dim).to(x1)
+            x0 = self.manifold.random_base(x1.shape[0], self.dim,
+                                           std=self.base_std).to(x1)
 
         N = x1.shape[0]
 

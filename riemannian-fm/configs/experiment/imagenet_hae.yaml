@@ -8,6 +8,13 @@ fm_conditioning: none
 cfg_label_dropout: 0.1
 cfg_cond_dim: 128
 
+# Std of the wrapped-normal base distribution p_0 on the Poincaré ball.
+# Smaller = samples start tightly near the origin (safer for the integrator,
+# but less coverage of the boundary); larger = wider initial spread.
+# Used for both training (rfm_loss_fn / compute_cost) and sampling.
+# Saved into .hydra/config.yaml so load_model() picks it up at inference time.
+base_std: 0.03
+
 model:
   d_model: 512
   num_layers: 5
