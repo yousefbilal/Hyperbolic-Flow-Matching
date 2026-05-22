@@ -169,8 +169,10 @@ def build_generated_loader(args):
 @torch.no_grad()
 def extract_features_and_update_metrics(loader, fid_metric, is_metric,
                                           device, label, is_real=False):
-    """Single forward pass per image — updates FID, IS, and returns the
-    2048-d Inception features and class labels for P/R + per-shot metrics.
+    """Single forward pass per image. Updates FID, IS, and returns the
+    2048-d Inception pool features, class labels, and (for generated
+    images) the 1000-d Inception softmax probabilities used for per-shot
+    Inception Score.
 
     Inputs are float [0, 1]; FID/IS metrics are built with normalize=True
     so they handle the [0,1] → uint8 conversion internally.
@@ -178,6 +180,7 @@ def extract_features_and_update_metrics(loader, fid_metric, is_metric,
     """
     feats_chunks = []
     label_chunks = []
+    prob_chunks  = []                                     # gen only
     n = 0
     for batch in loader:
         x, y = batch[0], batch[1]
@@ -187,17 +190,27 @@ def extract_features_and_update_metrics(loader, fid_metric, is_metric,
         if not is_real and is_metric is not None:
             is_metric.update(x)
 
-        # Pool features for P/R — the FID metric's Inception expects uint8.
+        # Pool features for P/R. The FID metric's Inception expects uint8.
         f = fid_metric.inception((x * 255).byte())
         feats_chunks.append(f.cpu())
         label_chunks.append(y.long())
+
+        # 1000-d softmax probabilities for per-shot IS. Only needed for
+        # generated images; reuses the IS metric's own Inception so we
+        # don't run a third Inception pass.
+        if not is_real and is_metric is not None:
+            logits = is_metric.inception((x * 255).byte())
+            prob_chunks.append(torch.softmax(logits, dim=-1).cpu())
+
         n += x.shape[0]
 
         if n % (loader.batch_size * 20) == 0:
             print(f"  [{label}] {n} images...", flush=True)
 
+    probs = torch.cat(prob_chunks, dim=0) if prob_chunks else None
     return (torch.cat(feats_chunks, dim=0),
             torch.cat(label_chunks, dim=0),
+            probs,
             n)
 
 
@@ -256,6 +269,31 @@ def compute_fid_from_features(real_feats: torch.Tensor,
         covmean = covmean.real
     return float(diff @ diff + np.trace(cov_r) + np.trace(cov_g)
                   - 2 * np.trace(covmean))
+
+
+def compute_is_from_probs(probs: torch.Tensor, n_splits: int = 10):
+    """Inception Score from per-image softmax probabilities.
+
+    IS = exp(E_x[KL(p(y|x) || p(y))]),  p(y) = E_x[p(y|x)].
+
+    Splits the input into n_splits equal chunks, computes IS on each,
+    returns (mean, std). Matches the splits-based variant used by
+    torchmetrics.InceptionScore. Falls back to NaN if there aren't
+    enough samples to fill n_splits.
+    """
+    N = probs.shape[0]
+    if N < n_splits or N == 0:
+        return float("nan"), float("nan")
+    split_size = N // n_splits
+    scores = []
+    for k in range(n_splits):
+        chunk = probs[k * split_size : (k + 1) * split_size]
+        py = chunk.mean(dim=0, keepdim=True)            # marginal p(y)
+        kl = (chunk * (torch.log(chunk + 1e-16)
+                       - torch.log(py + 1e-16))).sum(dim=-1)
+        scores.append(torch.exp(kl.mean()).item())
+    scores = np.array(scores)
+    return float(scores.mean()), float(scores.std())
 
 
 def get_shot_groups(args) -> dict:
@@ -340,16 +378,18 @@ def main():
 
     print("\nExtracting Inception features for REAL "
           "(updates FID's real stats simultaneously)...")
-    real_feats, real_labels, n_real = extract_features_and_update_metrics(
+    real_feats, real_labels, _, n_real = extract_features_and_update_metrics(
         real_loader, fid_metric, is_metric=None, device=device,
         label="real", is_real=True,
     )
 
     print("\nExtracting Inception features for GENERATED "
           "(updates FID's fake stats + IS simultaneously)...")
-    gen_feats, gen_labels, n_gen = extract_features_and_update_metrics(
-        gen_loader, fid_metric, is_metric=is_metric, device=device,
-        label="gen", is_real=False,
+    gen_feats, gen_labels, gen_probs, n_gen = (
+        extract_features_and_update_metrics(
+            gen_loader, fid_metric, is_metric=is_metric, device=device,
+            label="gen", is_real=False,
+        )
     )
 
     print("\n--- Global metrics ---")
@@ -393,11 +433,19 @@ def main():
             gen_sub  = gen_feats[gen_mask]
             shot_fid = compute_fid_from_features(real_sub, gen_sub)
             shot_pr  = compute_improved_pr(real_sub, gen_sub, k=args.knn_k)
+            shot_is_mean, shot_is_std = (
+                compute_is_from_probs(gen_probs[gen_mask],
+                                       n_splits=args.is_splits)
+                if gen_probs is not None
+                else (float("nan"), float("nan"))
+            )
             metrics["per_shot"][shot] = {
                 "n_classes": len(class_ids),
                 "n_real":    int(real_mask.sum()),
                 "n_gen":     int(gen_mask.sum()),
                 "FID":       shot_fid,
+                "IS_mean":   shot_is_mean,
+                "IS_std":    shot_is_std,
                 "precision": shot_pr["precision"],
                 "recall":    shot_pr["recall"],
                 "F_8":       shot_pr["F_8"],
@@ -407,6 +455,8 @@ def main():
                   f"n_real={int(real_mask.sum()):5d}  "
                   f"n_gen={int(gen_mask.sum()):5d}  "
                   f"FID={shot_fid:7.3f}  "
+                  f"IS={shot_is_mean:5.3f}±{shot_is_std:.3f}  "
+                  f"prec={shot_pr['precision']:.3f}  "
                   f"recall={shot_pr['recall']:.3f}  "
                   f"F_8={shot_pr['F_8']:.3f}  "
                   f"F_1/8={shot_pr['F_1/8']:.3f}")
@@ -418,7 +468,9 @@ def main():
         for shot in ("head", "mid", "tail"):
             if shot in metrics["per_shot"]:
                 ps = metrics["per_shot"][shot]
-                print(f"  {shot:<8s}  FID={ps['FID']:.3f}  Recall={ps['recall']:.3f}  "
+                print(f"  {shot:<8s}  FID={ps['FID']:.3f}  "
+                      f"IS={ps['IS_mean']:.3f}±{ps['IS_std']:.3f}  "
+                      f"P={ps['precision']:.3f}  R={ps['recall']:.3f}  "
                       f"F_8={ps['F_8']:.3f}  F_1/8={ps['F_1/8']:.3f}")
 
     if args.output_json:
