@@ -101,6 +101,31 @@ class FrozenSDVae(nn.Module):
         return self.vae.decode(latent / self.scaling).sample
 
 
+def _build_proj_mlp(in_dim: int, hidden_dims, out_dim: int,
+                     act: str = "silu") -> nn.Module:
+    """Build the projection between VAE flat latent and Euclidean feature.
+
+    If `hidden_dims` is empty, returns a single `nn.Linear` (the original
+    behaviour — preserves backward compat for old checkpoints).
+    Otherwise, builds `in_dim → h1 → h2 → ... → out_dim` with activations
+    between hidden layers but not on the final output (kept linear so the
+    downstream exp_map / decoder branch sees the full real line).
+    """
+    if not hidden_dims:
+        return nn.Linear(in_dim, out_dim)
+    act_cls = {
+        "silu": nn.SiLU, "swish": nn.SiLU,
+        "gelu": nn.GELU, "relu": nn.ReLU,
+    }[act.lower()]
+    layers = []
+    prev = in_dim
+    for h in hidden_dims:
+        layers += [nn.Linear(prev, h), act_cls()]
+        prev = h
+    layers.append(nn.Linear(prev, out_dim))
+    return nn.Sequential(*layers)
+
+
 class HAEImageNet(nn.Module):
     """HAE with a frozen pretrained image AE (SD-VAE or TAESD).
 
@@ -108,6 +133,13 @@ class HAEImageNet(nn.Module):
     channels, so for `image_size=S` the latent grid is `(4, S/8, S/8)` and
     flattens to `4·(S/8)²` features. Default S=256 (the SD-VAE training
     resolution); set S=64 for Tiny ImageNet etc.
+
+    `proj_hidden_dims` controls the depth of the learned projections
+    between the frozen-VAE flat latent and the Euclidean feature consumed
+    by the geometry head. The empty default `()` reproduces the original
+    single `nn.Linear` per side. Providing e.g. `(1024, 512)` builds
+    proj_enc as `flat_dim → 1024 → 512 → latent_dim` and mirrors the
+    sequence on proj_dec as `feature_size → 512 → 1024 → flat_dim`.
     """
 
     def __init__(
@@ -120,6 +152,8 @@ class HAEImageNet(nn.Module):
         tiny_vae: bool = False,
         image_size: int = 256,
         channels: int = SD_VAE_LATENT_CHANNELS,
+        proj_hidden_dims: tuple = (),
+        proj_actfn: str = "silu",
     ):
         super().__init__()
         if image_size % SD_VAE_DOWNSAMPLE != 0:
@@ -135,9 +169,15 @@ class HAEImageNet(nn.Module):
         # Frozen pretrained AE
         self.vae = FrozenSDVae(vae_name, tiny=tiny_vae)
 
-        # Learned projections between VAE latent and Euclidean feature
-        self.proj_enc = nn.Linear(self.flat_dim, latent_dim)
-        self.proj_dec = nn.Linear(feature_size, self.flat_dim)
+        # Learned projections between VAE latent and Euclidean feature.
+        # proj_dec mirrors proj_enc's hidden sequence so the AE is symmetric.
+        proj_hidden_dims = tuple(proj_hidden_dims or ())
+        self.proj_hidden_dims = proj_hidden_dims
+        self.proj_actfn = proj_actfn
+        self.proj_enc = _build_proj_mlp(self.flat_dim, proj_hidden_dims,
+                                         latent_dim, act=proj_actfn)
+        self.proj_dec = _build_proj_mlp(feature_size, proj_hidden_dims[::-1],
+                                         self.flat_dim, act=proj_actfn)
 
         # Shared geometry head (hyperbolic or Euclidean depending on curvature)
         self.head = GeometryHead(

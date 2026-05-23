@@ -81,6 +81,14 @@ def parse_args():
                         "default per dataset: cnn_cifar for CIFAR-10/100, "
                         "taesd for tiny_imagenet_lt (cheap pretrained), "
                         "sd_vae for imagenet_lt (full SD-VAE).")
+    p.add_argument("--proj_hidden_dims", type=int, nargs="*", default=[],
+                   help="Hidden widths for the proj_enc / proj_dec MLPs "
+                        "after the frozen VAE (HAEImageNet only). "
+                        "Empty (default) = original single-linear projection. "
+                        "Example: --proj_hidden_dims 1024 512  →  proj_enc is "
+                        "flat_dim → 1024 → 512 → latent_dim, and proj_dec "
+                        "mirrors it as feature_size → 512 → 1024 → flat_dim. "
+                        "Hidden layers use SiLU activations.")
 
     # imbalance handling
     p.add_argument("--sampler", type=str, default="instance",
@@ -418,10 +426,14 @@ def main():
             vae_name=vae_name,
             tiny_vae=is_tiny,
             image_size=image_size,
+            proj_hidden_dims=tuple(args.proj_hidden_dims or ()),
         ).to(device)
+        proj_desc = (f"MLP {list(args.proj_hidden_dims)}"
+                     if args.proj_hidden_dims else "single Linear")
         print(f"Using HAEImageNet [{bb.upper()}] @ {image_size}× "
               f"(frozen pretrained AE + hyperbolic head, "
-              f"latent_grid={image_size // 8}×{image_size // 8}×4)")
+              f"latent_grid={image_size // 8}×{image_size // 8}×4, "
+              f"proj={proj_desc})")
     elif bb == "cnn_cifar":
         variational = args.kl_lambda > 0.0
         model = HAECifar(
