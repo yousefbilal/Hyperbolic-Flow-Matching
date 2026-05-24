@@ -83,6 +83,14 @@ class FrozenSDVae(nn.Module):
         # some exotic backbone (no-op scaling, safer than 0.18215).
         self.scaling = float(getattr(self.vae.config, "scaling_factor", 1.0))
 
+        # Whether encode() draws from the posterior (True, default — gives
+        # HAE training stochastic VAE realisations) or returns the mean
+        # (False — deterministic, used at export time when you want a
+        # canonical embedding per image). Ignored for TAESD which has
+        # no posterior. Caller can flip this at runtime:
+        #     model.vae.sample_posterior = False    # deterministic
+        self.sample_posterior = True
+
     def train(self, mode: bool = True):
         # Keep the VAE in eval regardless of outer train() calls.
         super().train(mode)
@@ -90,12 +98,51 @@ class FrozenSDVae(nn.Module):
         return self
 
     @torch.no_grad()
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        # AutoencoderKL returns a posterior with .latent_dist.mean;
-        # AutoencoderTiny returns latents directly via .latents.
+    def encode(self, x: torch.Tensor, sample=None) -> torch.Tensor:
+        """Encode `x` and return a scaled latent.
+
+        For SD-VAE (AutoencoderKL):
+          - sample=True  → draws ε∼N(0,I) from the posterior (standard
+                           LDM training behaviour); HAE training therefore
+                           sees a different VAE realisation each call.
+          - sample=False → returns the posterior mean (deterministic,
+                           reproducible — use for embedding export when
+                           you want a single canonical z per image).
+          - sample=None  → defer to `self.sample_posterior` (default True).
+
+        For TAESD (AutoencoderTiny) there is no posterior, so the
+        `sample` flag is ignored and the deterministic point estimate
+        is returned in either case.
+        """
+        if sample is None:
+            sample = self.sample_posterior
         out = self.vae.encode(x)
-        latent = out.latents if self.tiny else out.latent_dist.mean
+        if self.tiny:
+            latent = out.latents
+        elif sample:
+            latent = out.latent_dist.sample()
+        else:
+            latent = out.latent_dist.mean
         return latent * self.scaling
+
+    @torch.no_grad()
+    def encode_dist(self, x: torch.Tensor):
+        """Return (mean, std) of the scaled posterior — for consumers
+        that want to draw fresh samples per call without re-running
+        Inception (e.g. saving stats once at export, sampling per
+        __getitem__ in the dataset).
+
+        TAESD has no posterior; std is returned as zeros for interface
+        parity.
+        """
+        out = self.vae.encode(x)
+        if self.tiny:
+            mean = out.latents
+            std = torch.zeros_like(mean)
+        else:
+            mean = out.latent_dist.mean
+            std = out.latent_dist.std
+        return mean * self.scaling, std * self.scaling
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         return self.vae.decode(latent / self.scaling).sample
