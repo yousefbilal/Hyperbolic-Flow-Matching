@@ -241,63 +241,193 @@ class HyperbolicDatasetPair(Dataset):
 
 
 #Old hyperbolic images class, before it was matching from uniform random noise to images
+def _build_proj_enc_from_meta(meta):
+    """Rebuild the HAE proj_enc MLP from saved meta. Mirrors
+    HAE/models/hae_imagenet.py:_build_proj_mlp."""
+    import torch.nn as nn
+    in_dim  = int(meta["flat_dim"])
+    out_dim = int(meta["latent_dim"])
+    hidden  = tuple(meta.get("proj_hidden_dims") or ())
+    act = str(meta.get("proj_actfn") or "silu").lower()
+    if not hidden:
+        return nn.Linear(in_dim, out_dim)
+    act_cls = {"silu": nn.SiLU, "swish": nn.SiLU,
+               "gelu": nn.GELU, "relu": nn.ReLU}[act]
+    layers, prev = [], in_dim
+    for h in hidden:
+        layers += [nn.Linear(prev, h), act_cls()]
+        prev = h
+    layers.append(nn.Linear(prev, out_dim))
+    return nn.Sequential(*layers)
+
+
 class HyperbolicImages(Dataset):
     dim = 512
 
-    """
-    Dataset for real hyperbolic embeddings on a Poincaré ball of curvature -c.
+    """Dataset for hyperbolic embeddings on a Poincaré ball.
+
+    Three storage modes, auto-detected from the data directory contents:
+
+      1. Pre-computed z_hyp embeddings, single sample per image.
+         emb tensor shape (N, D). Original behaviour.
+
+      2. Pre-computed z_hyp embeddings, K samples per image.
+         emb tensor shape (N, K, D). __getitem__ picks one of the K
+         realisations uniformly at random per access, so each batch
+         contains N distinct source images with fresh draws.
+
+      3. VAE posterior (mean, std) + saved proj_enc.
+         For each access: sample z_spatial = mean + std * ε  (ε ~ N(0, I)),
+         push through proj_enc, exp-map to the Poincaré ball. Gives
+         continuous posterior coverage with no K-sample storage cap.
+         Requires mean.pt, std.pt, proj_enc.pt, meta.pt (with mode
+         == "vae_dist") sitting in the same directory as emb_path.
     """
 
     def __init__(self, emb_path, label_path=None, pair_mode="self"):
         """
         Args:
-            emb_path: path to saved embeddings (torch.save)
-            label_path: optional label file
-            pair_mode:
-                "self" → x0 is tangent noise, x1 is embedding
-                "paired" → sample two different classes
-                "none" → return only x1 
+            emb_path: path to z_hyp.pt OR to a directory containing
+                      mean.pt + std.pt + proj_enc.pt + meta.pt for
+                      posterior-sampling mode.
+            label_path: optional label file (ignored in vae_dist mode —
+                        loaded from the same dir as the rest).
+            pair_mode: "self" | "paired" | "none" (see class docstring).
         """
-        self.emb = torch.tensor(torch.load(emb_path)).float()
+        self.pair_mode = pair_mode
+        self.manifold = PoincareBall()
 
-        # Ensure shapes [N, D]
-        if self.emb.ndim == 1:
-            self.emb = self.emb.unsqueeze(0)
-        elif self.emb.ndim > 2:
-            self.emb = self.emb.reshape(self.emb.shape[0], -1)
+        # Auto-detect posterior-stats mode. Either the caller passed the
+        # output directory directly, or they pointed at a z_hyp.pt whose
+        # sibling files include mean/std/proj_enc.
+        data_dir = (emb_path if os.path.isdir(emb_path)
+                    else os.path.dirname(emb_path))
+        meta_path = os.path.join(data_dir, "meta.pt")
+        mode = None
+        if os.path.exists(meta_path):
+            try:
+                mode = torch.load(meta_path, map_location="cpu").get("mode")
+            except Exception:
+                mode = None
+
+        is_vae_dist = (
+            mode == "vae_dist"
+            and os.path.exists(os.path.join(data_dir, "mean.pt"))
+            and os.path.exists(os.path.join(data_dir, "std.pt"))
+            and os.path.exists(os.path.join(data_dir, "proj_enc.pt"))
+        )
+
+        if is_vae_dist:
+            self._init_vae_dist(data_dir)
+        else:
+            self._init_z_hyp(emb_path, label_path)
+
+    # ----- mode A/B: precomputed z_hyp ------------------------------------
+    def _init_z_hyp(self, emb_path, label_path):
+        self.mode = "z_hyp"
+        emb = torch.tensor(torch.load(emb_path)).float()
+        if emb.ndim == 1:
+            emb = emb.unsqueeze(0)
+        # Accept (N, D), (N, K, D), or flatten anything higher.
+        if emb.ndim > 3:
+            emb = emb.reshape(emb.shape[0], -1)
+        self.emb = emb
+        self.k_samples = emb.shape[1] if emb.ndim == 3 else 1
+        self.dim = emb.shape[-1]
 
         self.labels = None
         if label_path is not None:
             self.labels = torch.tensor(torch.load(label_path))
+        self.proj_enc = None
 
-        self.manifold = PoincareBall()
-        self.dim = self.emb.shape[1]
-        self.pair_mode = pair_mode
+    # ----- mode C: posterior stats + proj_enc -----------------------------
+    def _init_vae_dist(self, data_dir):
+        self.mode = "vae_dist"
+        meta = torch.load(os.path.join(data_dir, "meta.pt"),
+                          map_location="cpu")
+        self.mean = torch.load(os.path.join(data_dir, "mean.pt"),
+                               map_location="cpu").float()
+        self.std  = torch.load(os.path.join(data_dir, "std.pt"),
+                               map_location="cpu").float()
+        self.labels = torch.load(os.path.join(data_dir, "labels.pt"),
+                                  map_location="cpu")
+        self.labels = torch.tensor(self.labels) if not torch.is_tensor(self.labels) \
+                       else self.labels
+
+        # Rebuild proj_enc and load its weights.
+        self.proj_enc = _build_proj_enc_from_meta(meta)
+        sd = torch.load(os.path.join(data_dir, "proj_enc.pt"),
+                        map_location="cpu")
+        self.proj_enc.load_state_dict(sd)
+        self.proj_enc.eval()
+        for p in self.proj_enc.parameters():
+            p.requires_grad_(False)
+
+        # Curvature → manifold + whether to apply exp_map. PoincareBall
+        # requires c > 0, so we fall back to Euclidean when the saved
+        # HAE was the curvature-0 ablation. The dataset still behaves
+        # correctly (no lift, no boundary), so the same class works for
+        # both hyperbolic and Euclidean HAE checkpoints without forcing
+        # the user to swap to EuclideanImages for an ablation.
+        curvature = float(meta.get("curvature", -1.0))
+        self.curvature = curvature
+        self.is_euclidean = abs(curvature) < 1e-6
+        if self.is_euclidean:
+            self.manifold = Euclidean()
+        else:
+            self.manifold = PoincareBall(c=abs(curvature))
+        self.dim = int(meta["latent_dim"])
+        self.k_samples = float("inf")
+        self.flat_dim = int(meta["flat_dim"])
 
     def __len__(self):
+        if self.mode == "vae_dist":
+            return self.mean.shape[0]
         return len(self.emb)
 
-
     def __getitem__(self, idx, dim=512):
-
-        x1 = self.emb[idx].reshape(-1)
+        if self.mode == "vae_dist":
+            x1 = self._sample_z_hyp(idx)
+        elif self.emb.ndim == 3:
+            # K-samples-per-image — pick one realisation per access for
+            # better per-batch diversity than concat-and-shuffle.
+            k = torch.randint(0, self.emb.shape[1], (1,)).item()
+            x1 = self.emb[idx, k].reshape(-1)
+        else:
+            x1 = self.emb[idx].reshape(-1)
         label = int(self.labels[idx].item()) if self.labels is not None else -1
 
         if self.pair_mode == "none":
             return {"x1": x1, "label": label}
 
         if self.pair_mode == "self":
-            # Uniform distribution from VRFM
-            #x0 = 2*torch.rand(dim) - 1
-            #x0 = PoincareBallManifold().wrap(x0)
-            x0 = self.manifold.wrapped_normal(self.dim, mean=torch.zeros(self.dim), std=0.03)
+            # Euclidean fallback: wrapped_normal is hyperbolic-specific.
+            if getattr(self, "is_euclidean", False):
+                x0 = self.manifold.random_normal(
+                    self.dim, mean=torch.zeros(self.dim), std=1.0,
+                )
+            else:
+                x0 = self.manifold.wrapped_normal(
+                    self.dim, mean=torch.zeros(self.dim), std=0.03,
+                )
             return {"x0": x0, "x1": x1, "label": label}
 
-        # Pair two different embeddings (e.g., across classes)
         if self.pair_mode == "paired":
-            j = torch.randint(0, len(self.emb), (1,)).item()
-            x0 = self.emb[j]
+            j = torch.randint(0, len(self), (1,)).item()
+            x0 = (self._sample_z_hyp(j) if self.mode == "vae_dist"
+                  else self.emb[j].reshape(-1))
             return {"x0": x0, "x1": x1, "label": label}
+
+    def _sample_z_hyp(self, idx):
+        """vae_dist mode: draw fresh VAE-posterior sample, project, then
+        lift to the ball (or return z_euc directly when curvature = 0)."""
+        eps = torch.randn_like(self.mean[idx])
+        z_spatial = self.mean[idx] + self.std[idx] * eps
+        z_flat = z_spatial.reshape(1, -1).float()
+        z_euc = self.proj_enc(z_flat).reshape(-1)
+        if self.is_euclidean:
+            return z_euc
+        return self.manifold.expmap0(z_euc)
 
     # ---- imbalance helpers (shared with EuclideanImages) -----------------
 
@@ -312,43 +442,125 @@ class HyperbolicImages(Dataset):
 class EuclideanImages(Dataset):
     dim = 9216 #512x18
 
-    """
-    Dataset for real Euclidean embeddings.
+    """Dataset for real Euclidean embeddings.
+
+    Same three storage modes as `HyperbolicImages`, auto-detected from
+    the data directory:
+
+      1. (N, D) z embeddings — single sample per image.
+      2. (N, K, D) z embeddings — pick 1 of K per __getitem__.
+      3. mean.pt + std.pt + proj_enc.pt + meta.pt — sample fresh
+         z_spatial = mean + std·ε per __getitem__, push through
+         proj_enc to land in Euclidean feature space directly
+         (no exp_map; this is the curvature-0 baseline).
     """
 
     def __init__(self, emb_path, label_path=None):
         """
         Args:
-            emb_path: path to saved embeddings (torch.save)
-            label_path: optional label file
-            pair_mode:
-                "self" → x0 is tangent noise, x1 is embedding
-                "paired" → sample two different classes
-                "none" → return only x1 
+            emb_path: path to z embeddings tensor OR to a directory
+                      containing mean.pt + std.pt + proj_enc.pt + meta.pt.
+            label_path: optional label file (ignored in vae_dist mode).
         """
-        self.emb = torch.tensor(torch.load(emb_path)).float()
+        self.manifold = Euclidean()
 
-        # Ensure shapes [N,512]
-        if self.emb.ndim == 1:
-            self.emb = self.emb.unsqueeze(0)
+        data_dir = (emb_path if os.path.isdir(emb_path)
+                    else os.path.dirname(emb_path))
+        meta_path = os.path.join(data_dir, "meta.pt")
+        mode = None
+        if os.path.exists(meta_path):
+            try:
+                mode = torch.load(meta_path, map_location="cpu").get("mode")
+            except Exception:
+                mode = None
+
+        is_vae_dist = (
+            mode == "vae_dist"
+            and os.path.exists(os.path.join(data_dir, "mean.pt"))
+            and os.path.exists(os.path.join(data_dir, "std.pt"))
+            and os.path.exists(os.path.join(data_dir, "proj_enc.pt"))
+        )
+
+        if is_vae_dist:
+            self._init_vae_dist(data_dir)
+        else:
+            self._init_z(emb_path, label_path)
+
+    # ----- mode A/B: precomputed z embeddings -----------------------------
+    def _init_z(self, emb_path, label_path):
+        self.mode = "z_hyp"
+        emb = torch.tensor(torch.load(emb_path)).float()
+        if emb.ndim == 1:
+            emb = emb.unsqueeze(0)
+        if emb.ndim > 3:
+            emb = emb.reshape(emb.shape[0], -1)
+        self.emb = emb
+        self.k_samples = emb.shape[1] if emb.ndim == 3 else 1
+        self.dim = emb.shape[-1]
 
         self.labels = None
         if label_path is not None:
             self.labels = torch.tensor(torch.load(label_path))
+        self.proj_enc = None
 
-        self.manifold = Euclidean()
-        self.dim = self.emb.shape[1]
+    # ----- mode C: posterior stats + proj_enc -----------------------------
+    def _init_vae_dist(self, data_dir):
+        self.mode = "vae_dist"
+        meta = torch.load(os.path.join(data_dir, "meta.pt"),
+                          map_location="cpu")
+        self.mean = torch.load(os.path.join(data_dir, "mean.pt"),
+                                map_location="cpu").float()
+        self.std  = torch.load(os.path.join(data_dir, "std.pt"),
+                                map_location="cpu").float()
+        labels = torch.load(os.path.join(data_dir, "labels.pt"),
+                             map_location="cpu")
+        self.labels = (labels if torch.is_tensor(labels)
+                       else torch.tensor(labels))
+
+        self.proj_enc = _build_proj_enc_from_meta(meta)
+        sd = torch.load(os.path.join(data_dir, "proj_enc.pt"),
+                        map_location="cpu")
+        self.proj_enc.load_state_dict(sd)
+        self.proj_enc.eval()
+        for p in self.proj_enc.parameters():
+            p.requires_grad_(False)
+
+        self.dim = int(meta["latent_dim"])
+        self.flat_dim = int(meta["flat_dim"])
+        self.k_samples = float("inf")
+        # Sanity warning if the export was from a hyperbolic HAE.
+        c = float(meta.get("curvature", 0.0))
+        if abs(c) > 1e-6:
+            print(f"[EuclideanImages] WARNING: meta.curvature = {c} but the "
+                  f"Euclidean dataset class skips exp_map. The hyperbolic "
+                  f"structure of the underlying HAE is being dropped — use "
+                  f"HyperbolicImages if that's not intended.")
 
     def __len__(self):
+        if self.mode == "vae_dist":
+            return self.mean.shape[0]
         return len(self.emb)
-    
-    
-    def __getitem__(self, idx, dim=512):
 
-        x1 = self.emb[idx]
-        x0 = self.manifold.random_normal(self.dim, mean=torch.zeros(self.dim), std=1.0)
+    def __getitem__(self, idx, dim=512):
+        if self.mode == "vae_dist":
+            x1 = self._sample_z(idx)
+        elif self.emb.ndim == 3:
+            k = torch.randint(0, self.emb.shape[1], (1,)).item()
+            x1 = self.emb[idx, k]
+        else:
+            x1 = self.emb[idx]
+        x0 = self.manifold.random_normal(self.dim,
+                                          mean=torch.zeros(self.dim),
+                                          std=1.0)
         label = int(self.labels[idx].item()) if self.labels is not None else -1
         return {"x0": x0, "x1": x1, "label": label}
+
+    def _sample_z(self, idx):
+        """vae_dist mode: draw fresh VAE-posterior sample, project, no lift."""
+        eps = torch.randn_like(self.mean[idx])
+        z_spatial = self.mean[idx] + self.std[idx] * eps
+        z_flat = z_spatial.reshape(1, -1).float()
+        return self.proj_enc(z_flat).reshape(-1)
 
     def get_class_counts(self):
         """Return torch.Tensor of shape (C,) with per-class sample counts,

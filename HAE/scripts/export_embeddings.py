@@ -47,6 +47,29 @@ def parse_args():
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--split", type=str, default="train",
                    choices=["train", "test"])
+    p.add_argument("--n_samples_per_image", type=int, default=1,
+                   help="Number of VAE-posterior samples to draw per image. "
+                        "With K=1 (default) and SD-VAE, each image yields one "
+                        "stochastic z_hyp (FrozenSDVae.encode samples by "
+                        "default). With K>1, the loader is iterated K times "
+                        "with different ε draws and the resulting embeddings "
+                        "are concatenated (labels replicated K times) — RFM "
+                        "training will then see K distinct z_hyp realisations "
+                        "per source image, exposing the VAE posterior to the "
+                        "downstream flow. No effect for TAESD (no posterior). "
+                        "Pass --deterministic_encode for a single canonical "
+                        "z per image using the posterior mean.")
+    p.add_argument("--deterministic_encode", action="store_true",
+                   help="Disable VAE-posterior sampling; use the posterior "
+                        "mean instead. Forces n_samples_per_image=1.")
+    p.add_argument("--save_vae_dist", action="store_true",
+                   help="Instead of saving stochastic z_hyp embeddings, save "
+                        "the SD-VAE posterior (mean, std) per image plus the "
+                        "trained proj_enc state_dict. Lets the RFM dataset "
+                        "draw a fresh ε per __getitem__ (continuous coverage "
+                        "of the posterior, no K-sample storage explosion). "
+                        "HAEImageNet only; TAESD writes zero-std. Output files "
+                        "are mean.pt, std.pt, proj_enc.pt, labels.pt, meta.pt.")
     return p.parse_args()
 
 
@@ -140,23 +163,117 @@ def main():
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.workers, pin_memory=True)
 
+    # ---------------------------------------------------------------------
+    # Branch: posterior-stats export (mean + std + proj_enc) for on-the-fly
+    # sampling in the RFM dataset.
+    # ---------------------------------------------------------------------
+    if args.save_vae_dist:
+        if not hasattr(model, "vae"):
+            raise SystemExit("--save_vae_dist requires an HAEImageNet "
+                             "checkpoint (sd_vae / taesd backbone).")
+        print("Exporting VAE posterior (mean, std) + proj_enc state_dict.")
+
+        all_mean, all_std, all_labels = [], [], []
+        with torch.no_grad():
+            for images, labels in loader:
+                images = images.to(device)
+                mean, std = model.vae.encode_dist(images)
+                all_mean.append(mean.cpu())
+                all_std.append(std.cpu())
+                all_labels.append(labels)
+
+        mean = torch.cat(all_mean, dim=0)             # (N, C, S/8, S/8)
+        std  = torch.cat(all_std,  dim=0)             # (N, C, S/8, S/8)
+        labels = torch.cat(all_labels, dim=0)
+
+        # Slice proj_enc weights out of the full state dict. The RFM
+        # dataset will rebuild the same MLP and load these.
+        sd = ckpt["state_dict"]
+        proj_enc_sd = {k[len("proj_enc."):]: v
+                       for k, v in sd.items() if k.startswith("proj_enc.")}
+        # Also save the architectural shape so the dataset can rebuild.
+        proj_hidden_dims = list(saved_args.get("proj_hidden_dims") or ())
+        proj_actfn = str(saved_args.get("proj_actfn") or "silu")
+
+        mean_path = os.path.join(args.output_dir, "mean.pt")
+        std_path  = os.path.join(args.output_dir, "std.pt")
+        pe_path   = os.path.join(args.output_dir, "proj_enc.pt")
+        l_path    = os.path.join(args.output_dir, "labels.pt")
+        m_path    = os.path.join(args.output_dir, "meta.pt")
+
+        torch.save(mean, mean_path)
+        torch.save(std,  std_path)
+        torch.save(proj_enc_sd, pe_path)
+        torch.save(labels, l_path)
+        torch.save({
+            "mode":              "vae_dist",
+            "num_classes":       int(num_classes),
+            "dataset":           args.dataset,
+            "curvature":         float(curvature),
+            "feature_size":      int(saved_args.get("feature_size") or 512),
+            "latent_dim":        int(saved_args.get("latent_dim") or 512),
+            "flat_dim":          int(model.flat_dim),
+            "channels":          int(model.channels),
+            "spatial":           int(model.spatial),
+            "proj_hidden_dims":  proj_hidden_dims,
+            "proj_actfn":        proj_actfn,
+        }, m_path)
+
+        print(f"  Saved: {mean_path}  ({tuple(mean.shape)})  "
+              f"mean·mean={mean.mean().item():.4f}  std·std={std.mean().item():.4f}")
+        print(f"  Saved: {std_path}   ({tuple(std.shape)})")
+        print(f"  Saved: {pe_path}    (proj_enc state_dict, {len(proj_enc_sd)} tensors)")
+        print(f"  Saved: {l_path}     ({tuple(labels.shape)})")
+        print(f"  Saved: {m_path}")
+        return
+
+    # ---------------------------------------------------------------------
+    # Default branch: precomputed z_hyp embeddings (one or K per image).
+    # ---------------------------------------------------------------------
+    if hasattr(model, "vae"):
+        if args.deterministic_encode:
+            model.vae.sample_posterior = False
+            n_passes = 1
+            print("VAE encode mode: posterior MEAN (deterministic)")
+        else:
+            model.vae.sample_posterior = True
+            n_passes = max(1, int(args.n_samples_per_image))
+            print(f"VAE encode mode: posterior SAMPLE, "
+                  f"{n_passes} pass(es) over the dataset")
+    else:
+        n_passes = 1   # HAECifar / non-VAE backbones — single deterministic pass
+
     all_z_hyp, all_labels = [], []
     with torch.no_grad():
-        for images, labels in loader:
-            images = images.to(device)
-            # 6-tuple now: (recon, logits, z_hyp, z_euc, z_euc_dec, kl).
-            # In VAE mode, model.eval() makes the encoder return μ (deterministic),
-            # so exported z_hyp is reproducible across calls.
-            _, _, z_hyp, _, _, _ = model(images)
-            all_z_hyp.append(z_hyp.cpu())
-            all_labels.append(labels)
+        for k in range(n_passes):
+            if n_passes > 1:
+                print(f"  Pass {k + 1}/{n_passes}...")
+            for images, labels in loader:
+                images = images.to(device)
+                # 6-tuple: (recon, logits, z_hyp, z_euc, z_euc_dec, kl).
+                # When sample_posterior=True the VAE draws a fresh ε each call,
+                # so successive passes give distinct z_hyp realisations per image.
+                _, _, z_hyp, _, _, _ = model(images)
+                all_z_hyp.append(z_hyp.cpu())
+                all_labels.append(labels)
 
     z_hyp = torch.cat(all_z_hyp, dim=0)
     labels = torch.cat(all_labels, dim=0)
 
+    # If K passes, reshape (K·N, D) → (N, K, D) so the dataset can
+    # pick one realisation per __getitem__ rather than treating
+    # duplicates as independent rows (better per-batch diversity).
+    if n_passes > 1:
+        N_per_pass = z_hyp.shape[0] // n_passes
+        D = z_hyp.shape[1]
+        z_hyp  = z_hyp.reshape(n_passes, N_per_pass, D).permute(1, 0, 2).contiguous()
+        labels = labels.reshape(n_passes, N_per_pass)[0]    # identical across passes
+
     is_euclidean = abs(float(curvature)) < EUCLIDEAN_EPS
-    norms = z_hyp.norm(dim=-1)
-    print(f"Exported {z_hyp.shape[0]} embeddings  dim={z_hyp.shape[1]}")
+    flat = z_hyp.reshape(-1, z_hyp.shape[-1])
+    norms = flat.norm(dim=-1)
+    print(f"Exported {flat.shape[0]} embeddings  dim={flat.shape[1]}  "
+          f"(stored as {tuple(z_hyp.shape)})")
     print(f"  Norm stats: min={norms.min():.4f}  max={norms.max():.4f}  "
           f"mean={norms.mean():.4f}")
     if is_euclidean:
@@ -170,13 +287,16 @@ def main():
     m_path = os.path.join(args.output_dir, "meta.pt")
     torch.save(z_hyp, z_path)
     torch.save(labels, l_path)
-    torch.save({"num_classes": int(num_classes),
-                "dataset": args.dataset,
-                "curvature": float(curvature),
-                "feature_size": int(z_hyp.shape[1])},
+    torch.save({"mode":                "z_hyp",
+                "num_classes":         int(num_classes),
+                "dataset":             args.dataset,
+                "curvature":           float(curvature),
+                "feature_size":        int(z_hyp.shape[-1]),
+                "n_samples_per_image": int(n_passes),
+                "deterministic_encode": bool(args.deterministic_encode)},
                m_path)
-    print(f"  Saved: {z_path}  ({z_hyp.shape})")
-    print(f"  Saved: {l_path}  ({labels.shape})")
+    print(f"  Saved: {z_path}  ({tuple(z_hyp.shape)})")
+    print(f"  Saved: {l_path}  ({tuple(labels.shape)})")
     print(f"  Saved: {m_path}")
 
 
