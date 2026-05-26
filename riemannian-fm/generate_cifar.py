@@ -45,7 +45,7 @@ def parse_args():
 
 def load_hae(checkpoint_path, device):
     """Load the full HAE model (CIFAR or ImageNet) so we have encoder+decoder."""
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     saved_args = ckpt.get("args", {})
     dataset = saved_args.get("dataset", "cifar10")
     # NB: explicit None-check rather than `or` — curvature=0 is the legitimate
