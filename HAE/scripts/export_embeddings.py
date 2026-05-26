@@ -152,7 +152,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Loading checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    ckpt = torch.load(args.checkpoint, map_location="cpu",
+                      weights_only=False)
     saved_args = ckpt.get("args", {})
 
     ds, num_classes = build_dataset(args, saved_args)

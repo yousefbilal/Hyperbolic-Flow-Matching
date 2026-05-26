@@ -36,7 +36,7 @@ def get_job_directory(file_or_checkpoint: Union[str, Dict[str, Any]]) -> str:
 
 
 def load_model(checkpoint: str, eval_projx=None, atol=None, rtol=None):
-    chkpnt = torch.load(checkpoint, map_location="cpu")
+    chkpnt = torch.load(checkpoint, map_location="cpu", weights_only=False)
     job_dir = get_job_directory(checkpoint)
     cfg = OmegaConf.load(os.path.join(job_dir, ".hydra/config.yaml"))
 

@@ -501,7 +501,7 @@ def main():
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f"--resume path does not exist: {args.resume}")
         print(f"Resuming from {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         # state_dict — strict by default; if the saved ckpt doesn't have a
         # field that the current model expects (e.g. legacy ckpts without
         # the new VAE heads), fall back to non-strict and warn loudly.
